@@ -1,0 +1,2 @@
+# 3D-Estimation-of-VFOA
+The dissertation project is named 3D Estimation of VFOA, where Attention is calculated based on the person's Gaze and Head Pose. Furthermore, to locate and better identify the object(s) of interest it's used a 3D Point Cloud, which receives the information from the panoptic segmentation providing the 2D location and the stereo camera disparity utilized to create the point cloud. 
