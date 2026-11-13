@@ -1,9 +1,11 @@
 import cv2
 import numpy as np
-from matplotlib import pyplot as plt
-import open3d as o3d
+
+# matplotlib and open3d are imported lazily inside the functions that use them.
 
 def reconstruction_3D(disparity, matrix_Q, colors_image):
+    from matplotlib import pyplot as plt
+
     #Show disparity map before generating 3D cloud to verify that point cloud will be usable. 
     fig = plt.figure("Disparity")
     plt.imshow(disparity)
@@ -46,8 +48,9 @@ def create_output(vertices, colors, filename):
             np.savetxt(f, vertices, '%f %f %f %d %d %d')
 
 def create_point_cloud(file_output_3D, output_points, output_colors):
+    import open3d as o3d
+
     print ("\nCreating the output file ...\n")
-    #file_output_3D="/home/carlos/Thesis_GOD/detectron2/Thesis_GOD/Final_videos/StereoImgs/Piano-perfect/new_video_depth_image.ply"
     create_output(output_points, output_colors, file_output_3D)
 
     print("Load a ply point cloud, print it, and render it")

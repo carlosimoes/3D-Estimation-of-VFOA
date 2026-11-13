@@ -1,7 +1,8 @@
-import numpy as np
-import cv2
-import torch
+import os
 import random
+
+import cv2
+import numpy as np
 
 from prediction_depth import compute_scale_and_shift
 from DepthPredictor_Mono import DepthPredictor_Mono
@@ -10,9 +11,12 @@ from Reconstruction_3D import create_point_cloud
 
 
 class Reconstruction_Mono_3D:
-    def __init__(self, Metadata_panoptic, matrix_Q):
+    def __init__(self, Metadata_panoptic, matrix_Q, ply_path="3d.ply", midas_weights=None):
         self.metadata = Metadata_panoptic
         self.matrix_Q = matrix_Q
+        self.ply_path = ply_path
+        # MiDaS weights: argument, else env VFOA_MIDAS_WEIGHTS
+        self.midas_weights = midas_weights or os.environ.get("VFOA_MIDAS_WEIGHTS")
         
 
     def __call__(self,frames, disparity, panoptic_results):
@@ -25,7 +29,7 @@ class Reconstruction_Mono_3D:
             disparity_mono = self.get_mono_depth(frames[i])
             final_points, final_colors = self.get_Prediction(points_3d, depth_extracted,mask_to_depth, disparity_mono, frames[i])
 
-            create_point_cloud("/home/carlos/Thesis_GOD/detectron2/Thesis_GOD/Final_videos/video_final2/3d.ply", final_points, final_colors)
+            create_point_cloud(self.ply_path, final_points, final_colors)
             input()
         return(0)
 
@@ -72,12 +76,16 @@ class Reconstruction_Mono_3D:
         return (destino, mask)
     
     def get_mono_depth(self, frame):
-        depth2=DepthPredictor_Mono("/home/carlos/Thesis_GOD/detectron2/MiDaS/model-f46da743.pt",1)
+        if not self.midas_weights:
+            raise ValueError("MiDaS weights not set: pass midas_weights or set env VFOA_MIDAS_WEIGHTS")
+        depth2=DepthPredictor_Mono(self.midas_weights,1)
         prediction=depth2([frame])
         del depth2
         return (prediction)
 
     def get_Prediction(self, points, destino, mask, mono_depth, frame):
+        import torch
+
         # calculate scale and shift
         print(torch.from_numpy(mono_depth[0]).unsqueeze(0).shape)
         print(torch.from_numpy(destino).unsqueeze(0).shape)
