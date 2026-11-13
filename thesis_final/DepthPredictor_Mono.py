@@ -1,19 +1,39 @@
-import sys
-from torch import load, no_grad, zeros
-from torch.nn import DataParallel
-from torch.cuda import empty_cache as cudaEmptyCache
-from time import time as timeSeconds
-from numpy import array,float16
-from torch.utils.data import Dataset, DataLoader
-import torch
-import cv2
-from torchvision.transforms import Compose
-from matplotlib import pyplot as plt
+"""Monocular depth with MiDaS (legacy thesis code; torch and MiDaS imported lazily).
 
-sys.path.append("/home/carlos/Thesis_GOD/detectron2/MiDaS")
-import utils
-from midas.midas_net import MidasNet
-from midas.transforms import Resize, NormalizeImage, PrepareForNet
+MiDaS is found through env ``VFOA_MIDAS_ROOT`` (the MiDaS checkout), else
+``$VFOA_THIRD_PARTY/MiDaS``.
+"""
+
+import _bootstrap  # noqa: F401  (adds the repo root to sys.path)
+
+import logging
+import os
+import sys
+from time import time as timeSeconds
+
+import cv2
+
+from vfoa.backends.base import BackendUnavailable
+
+logger = logging.getLogger(__name__)
+
+
+def _midas():
+    """Import MiDaS lazily; returns (MidasNet, Resize, NormalizeImage, PrepareForNet)."""
+    root = os.environ.get("VFOA_MIDAS_ROOT")
+    if not root and os.environ.get("VFOA_THIRD_PARTY"):
+        root = os.path.join(os.environ["VFOA_THIRD_PARTY"], "MiDaS")
+    if root and os.path.isdir(root) and root not in sys.path:
+        sys.path.append(root)
+    try:
+        from midas.midas_net import MidasNet
+        from midas.transforms import NormalizeImage, PrepareForNet, Resize
+    except ImportError as exc:
+        raise BackendUnavailable(
+            "MiDaS is not available: set VFOA_MIDAS_ROOT to a MiDaS checkout "
+            f"(or VFOA_THIRD_PARTY to a directory containing MiDaS) [{exc}]"
+        ) from exc
+    return MidasNet, Resize, NormalizeImage, PrepareForNet
 
 
 class DepthPredictor_Mono:
@@ -21,6 +41,8 @@ class DepthPredictor_Mono:
         """
         :param depthModelFile: path to model file.
         """
+        import torch
+
         self.depthmodel = depthModelFile
         self.batchSize = batchSize
         # set torch options
@@ -34,8 +56,17 @@ class DepthPredictor_Mono:
         :param inputs: video frames
         :return: list of predictions of depth
         """
+        import torch
+        from torch.utils.data import DataLoader
+
+        MidasNet = _midas()[0]
         # select device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        def empty_cache():
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         # load network
         self.model = MidasNet(self.depthmodel, non_negative=True)
         self.model.to(device)
@@ -45,10 +76,10 @@ class DepthPredictor_Mono:
         depthList = []
         nBatches = len(loader)
         step = max(1, len(loader) // 10)
-        with no_grad():
+        with torch.no_grad():
             for i, data in enumerate(loader):
                 if i % step == 0:
-                    print("Depth batch :", i + 1, "/", nBatches)
+                    logger.info("Depth batch : %d / %d", i + 1, nBatches)
                 image = torch.from_numpy(data.to("cpu").numpy()[0]).to(device).unsqueeze(0)
                 prediction = self.model.forward(image)
                 prediction = (
@@ -64,15 +95,22 @@ class DepthPredictor_Mono:
                 )
                 depthList.append(prediction)
                 del data, prediction
-                cudaEmptyCache()
+                empty_cache()
         t = timeSeconds() - t
-        print("Depth estimator :", t, "seconds;", len(loader.dataset) / t, "estimated images per second")
+        logger.info("Depth estimator : %.3f seconds; %.2f estimated images per second",
+                    t, len(loader.dataset) / t if t > 0 else 0.0)
         del loader.dataset, loader, self.model
-        cudaEmptyCache()
+        empty_cache()
         return depthList
 
-class DepthDataSet(Dataset):
+
+class DepthDataSet:
+    """Map-style dataset of frames (DataLoader only needs ``__len__``/``__getitem__``)."""
+
     def __init__(self, frames):
+        from torchvision.transforms import Compose
+
+        _, Resize, NormalizeImage, PrepareForNet = _midas()
         self.frames = frames
         self.transform = Compose(
             [

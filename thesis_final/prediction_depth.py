@@ -1,8 +1,14 @@
-import torch
-import torch.nn as nn
+"""Scale-and-shift alignment and losses for monocular depth (MiDaS paper code).
+
+torch is imported lazily: the functions import it when called, and the
+``nn.Module`` classes ``MSELoss``, ``GradientLoss`` and
+``ScaleAndShiftInvariantLoss`` are built on first attribute access (PEP 562).
+"""
 
 
 def compute_scale_and_shift(prediction, target, mask):
+    import torch
+
     # system matrix: A = [[a_00, a_01], [a_10, a_11]]
     a_00 = torch.sum(mask * prediction * prediction, (1, 2))
     a_01 = torch.sum(mask * prediction, (1, 2))
@@ -26,6 +32,8 @@ def compute_scale_and_shift(prediction, target, mask):
 
 
 def reduction_batch_based(image_loss, M):
+    import torch
+
     # average of all valid pixels of the batch
 
     # avoid division by 0 (if sum(M) = sum(sum(mask)) = 0: sum(image_loss) = 0)
@@ -38,6 +46,8 @@ def reduction_batch_based(image_loss, M):
 
 
 def reduction_image_based(image_loss, M):
+    import torch
+
     # mean of average of valid pixels of an image
 
     # avoid division by 0 (if M = sum(mask) = 0: image_loss = 0)
@@ -49,6 +59,7 @@ def reduction_image_based(image_loss, M):
 
 
 def mse_loss(prediction, target, mask, reduction=reduction_batch_based):
+    import torch
 
     M = torch.sum(mask, (1, 2))
     res = prediction - target
@@ -58,6 +69,7 @@ def mse_loss(prediction, target, mask, reduction=reduction_batch_based):
 
 
 def gradient_loss(prediction, target, mask, reduction=reduction_batch_based):
+    import torch
 
     M = torch.sum(mask, (1, 2))
 
@@ -77,64 +89,83 @@ def gradient_loss(prediction, target, mask, reduction=reduction_batch_based):
     return reduction(image_loss, M)
 
 
-class MSELoss(nn.Module):
-    def __init__(self, reduction='batch-based'):
-        super().__init__()
-
-        if reduction == 'batch-based':
-            self.__reduction = reduction_batch_based
-        else:
-            self.__reduction = reduction_image_based
-
-    def forward(self, prediction, target, mask):
-        return mse_loss(prediction, target, mask, reduction=self.__reduction)
+_LOSS_CLASSES = ("MSELoss", "GradientLoss", "ScaleAndShiftInvariantLoss")
+_built = {}
 
 
-class GradientLoss(nn.Module):
-    def __init__(self, scales=4, reduction='batch-based'):
-        super().__init__()
+def _build_losses():
+    """Define the torch ``nn.Module`` loss classes once (imports torch)."""
+    if _built:
+        return _built
+    import torch.nn as nn
 
-        if reduction == 'batch-based':
-            self.__reduction = reduction_batch_based
-        else:
-            self.__reduction = reduction_image_based
+    class MSELoss(nn.Module):
+        def __init__(self, reduction='batch-based'):
+            super().__init__()
 
-        self.__scales = scales
+            if reduction == 'batch-based':
+                self.__reduction = reduction_batch_based
+            else:
+                self.__reduction = reduction_image_based
 
-    def forward(self, prediction, target, mask):
-        total = 0
+        def forward(self, prediction, target, mask):
+            return mse_loss(prediction, target, mask, reduction=self.__reduction)
 
-        for scale in range(self.__scales):
-            step = pow(2, scale)
+    class GradientLoss(nn.Module):
+        def __init__(self, scales=4, reduction='batch-based'):
+            super().__init__()
 
-            total += gradient_loss(prediction[:, ::step, ::step], target[:, ::step, ::step],
-                                   mask[:, ::step, ::step], reduction=self.__reduction)
+            if reduction == 'batch-based':
+                self.__reduction = reduction_batch_based
+            else:
+                self.__reduction = reduction_image_based
 
-        return total
+            self.__scales = scales
+
+        def forward(self, prediction, target, mask):
+            total = 0
+
+            for scale in range(self.__scales):
+                step = pow(2, scale)
+
+                total += gradient_loss(prediction[:, ::step, ::step], target[:, ::step, ::step],
+                                       mask[:, ::step, ::step], reduction=self.__reduction)
+
+            return total
+
+    class ScaleAndShiftInvariantLoss(nn.Module):
+        def __init__(self, alpha=0.5, scales=4, reduction='batch-based'):
+            super().__init__()
+
+            self.__data_loss = MSELoss(reduction=reduction)
+            self.__regularization_loss = GradientLoss(scales=scales, reduction=reduction)
+            self.__alpha = alpha
+
+            self.__prediction_ssi = None
+
+        def forward(self, prediction, target, mask):
+
+            scale, shift = compute_scale_and_shift(prediction, target, mask)
+            self.__prediction_ssi = scale.view(-1, 1, 1) * prediction + shift.view(-1, 1, 1)
+
+            total = self.__data_loss(self.__prediction_ssi, target, mask)
+            if self.__alpha > 0:
+                total += self.__alpha * self.__regularization_loss(self.__prediction_ssi, target, mask)
+
+            return total
+
+        def __get_prediction_ssi(self):
+            return self.__prediction_ssi
+
+        prediction_ssi = property(__get_prediction_ssi)
+
+    for cls in (MSELoss, GradientLoss, ScaleAndShiftInvariantLoss):
+        cls.__module__ = __name__
+        _built[cls.__name__] = cls
+    return _built
 
 
-class ScaleAndShiftInvariantLoss(nn.Module):
-    def __init__(self, alpha=0.5, scales=4, reduction='batch-based'):
-        super().__init__()
-
-        self.__data_loss = MSELoss(reduction=reduction)
-        self.__regularization_loss = GradientLoss(scales=scales, reduction=reduction)
-        self.__alpha = alpha
-
-        self.__prediction_ssi = None
-
-    def forward(self, prediction, target, mask):
-
-        scale, shift = compute_scale_and_shift(prediction, target, mask)
-        self.__prediction_ssi = scale.view(-1, 1, 1) * prediction + shift.view(-1, 1, 1)
-
-        total = self.__data_loss(self.__prediction_ssi, target, mask)
-        if self.__alpha > 0:
-            total += self.__alpha * self.__regularization_loss(self.__prediction_ssi, target, mask)
-
-        return total
-
-    def __get_prediction_ssi(self):
-        return self.__prediction_ssi
-
-    prediction_ssi = property(__get_prediction_ssi)
+def __getattr__(name):
+    if name in _LOSS_CLASSES:
+        return _build_losses()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
