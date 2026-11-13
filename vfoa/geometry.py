@@ -243,33 +243,50 @@ def gaze360_to_camera(yaw_rad, pitch_rad, eye_ray: Optional[np.ndarray] = None) 
 
     Eye frame: ``g = (cos p sin t, sin p, -cos p cos t)`` (x right, y up, -z
     towards the camera); camera frame without correction: ``(g.x, -g.y, g.z)``.
-    With ``eye_ray`` (camera -> eye vector, any length) the eye frame is aligned
-    with that ray: ``ez = unit(eye_ray)``, ``ex = unit(cross([0,1,0], ez))``,
-    ``ey = cross(ez, ex)`` and ``g_cam = g.x ex - g.y ey + g.z ez``, so
-    ``t = p = 0`` looks back along the ray at the camera. A ``None``, zero or
-    non-finite ``eye_ray`` means no correction. Broadcasts over ``t, p``.
+    With ``eye_ray`` (camera -> eye vector in the camera frame, any length) the
+    eye frame is aligned with that ray: ``ez = unit(eye_ray)``,
+    ``ex = unit(cross([0,1,0], ez))`` (``(1,0,0)`` when the ray is parallel to
+    Y), ``ey = cross(ez, ex)`` and ``g_cam = g.x ex - g.y ey + g.z ez``, so
+    ``t = p = 0`` looks back along the ray at the camera.
+
+    ``eye_ray`` may be ``None``, a ``(3,)`` vector or a ``(..., 3)`` array (one
+    ray per person). The output shape is
+    ``broadcast_shapes(t.shape, p.shape, eye_ray.shape[:-1]) + (3,)``. Rows whose
+    ray is zero or non-finite are returned uncorrected. Raises ValueError when
+    the last dimension of ``eye_ray`` is not 3.
     """
     t = np.asarray(yaw_rad, dtype=np.float64)
     p = np.asarray(pitch_rad, dtype=np.float64)
-    t, p = np.broadcast_arrays(t, p)
-    gx = np.cos(p) * np.sin(t)
-    gy = np.sin(p)
-    gz = -np.cos(p) * np.cos(t)
-    ez = None
-    if eye_ray is not None:
-        e = np.asarray(eye_ray, dtype=np.float64).reshape(-1)
-        if e.shape == (3,) and np.isfinite(e).all():
-            n = float(np.linalg.norm(e))
-            if n > _EPS:
-                ez = e / n
-    if ez is None:
-        out = np.stack([gx, -gy, gz], axis=-1)
-    else:
-        c = np.cross(np.array([0.0, 1.0, 0.0]), ez)
-        cn = float(np.linalg.norm(c))
-        ex = c / cn if cn >= 1e-9 else np.array([1.0, 0.0, 0.0])
-        ey = np.cross(ez, ex)
-        out = gx[..., None] * ex - gy[..., None] * ey + gz[..., None] * ez
+    if eye_ray is None:
+        t, p = np.broadcast_arrays(t, p)
+        out = np.stack([np.cos(p) * np.sin(t), -np.sin(p), -np.cos(p) * np.cos(t)], axis=-1)
+        return normalize(out) + 0.0
+    e = np.asarray(eye_ray, dtype=np.float64)
+    if e.ndim == 0 or e.shape[-1] != 3:
+        raise ValueError(f"eye_ray must have shape (..., 3), got {e.shape}")
+    shape = np.broadcast_shapes(t.shape, p.shape, e.shape[:-1])
+    t = np.broadcast_to(t, shape)
+    p = np.broadcast_to(p, shape)
+    e = np.broadcast_to(e, shape + (3,))
+    gx = (np.cos(p) * np.sin(t))[..., None]
+    gy = np.sin(p)[..., None]
+    gz = (-np.cos(p) * np.cos(t))[..., None]
+    uncorrected = np.concatenate([gx, -gy, gz], axis=-1)
+
+    finite = np.isfinite(e).all(axis=-1)
+    e0 = np.where(finite[..., None], e, 0.0)
+    n = np.linalg.norm(e0, axis=-1)
+    ok = finite & (n > _EPS)
+    ez = np.where(ok[..., None], e0 / np.where(ok, n, 1.0)[..., None],
+                  np.array([0.0, 0.0, 1.0]))
+    c = np.cross(np.array([0.0, 1.0, 0.0]), ez)
+    cn = np.linalg.norm(c, axis=-1)
+    cok = cn >= 1e-9
+    ex = np.where(cok[..., None], c / np.where(cok, cn, 1.0)[..., None],
+                  np.array([1.0, 0.0, 0.0]))
+    ey = np.cross(ez, ex)
+    corrected = gx * ex - gy * ey + gz * ez
+    out = np.where(ok[..., None], corrected, uncorrected)
     return normalize(out) + 0.0
 
 

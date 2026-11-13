@@ -176,6 +176,39 @@ def test_gaze360_eye_ray(rng):
     np.testing.assert_allclose(np.linalg.norm(gs, axis=-1), 1.0, atol=1e-12)
 
 
+def test_gaze360_batched_eye_ray(rng):
+    # (a) one off-axis ray per person: looking at the camera = -unit(ray), row-wise
+    rays = np.array([[0.5, -0.3, 2.0], [-1.0, 0.2, 3.0], [0.1, 0.9, 1.5], [2.0, 0.0, 0.5]])
+    out = gaze360_to_camera(np.zeros(4), np.zeros(4), rays)
+    assert out.shape == (4, 3)
+    np.testing.assert_allclose(out, -normalize(rays), atol=1e-12)
+    # (b) batched == per-row scalar calls, including degenerate rows
+    rays = np.concatenate(
+        [
+            rng.normal(size=(6, 3)) * 2.0,
+            [[0.0, 0.0, 0.0], [np.nan, 1.0, 1.0], [0.0, 3.0, 0.0], [0.0, -0.5, 0.0]],
+        ]
+    )
+    yaw = rng.uniform(-3, 3, len(rays))
+    pitch = rng.uniform(-1.5, 1.5, len(rays))
+    batched = gaze360_to_camera(yaw, pitch, rays)
+    rows = np.array([gaze360_to_camera(yaw[i], pitch[i], rays[i]) for i in range(len(rays))])
+    assert batched.shape == (len(rays), 3)
+    np.testing.assert_allclose(batched, rows, atol=1e-12)
+    assert np.isfinite(batched).all()
+    np.testing.assert_allclose(np.linalg.norm(batched, axis=-1), 1.0, atol=1e-12)
+    # zero / NaN rows are uncorrected
+    np.testing.assert_allclose(batched[6], gaze360_to_camera(yaw[6], pitch[6]), atol=1e-12)
+    np.testing.assert_allclose(batched[7], gaze360_to_camera(yaw[7], pitch[7]), atol=1e-12)
+    # (c) (N,) angles with a single (3,) ray
+    single = gaze360_to_camera(yaw, pitch, [0.5, -0.3, 2.0])
+    assert single.shape == (len(rays), 3)
+    # (d) wrong last dimension
+    for bad in ([1.0, 2.0], np.zeros((3, 2)), 5.0):
+        with pytest.raises(ValueError):
+            gaze360_to_camera(0.0, 0.0, bad)
+
+
 # --------------------------------------------------------------------------- cones
 
 
