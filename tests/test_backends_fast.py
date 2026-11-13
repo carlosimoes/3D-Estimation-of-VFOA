@@ -74,7 +74,7 @@ def make_frame(w=640, h=480, index=3, intrinsics=None):
 def face_keypoints(cx=300.0, cy=100.0, conf=0.9):
     kp = np.zeros((17, 3), np.float32)
     kp[0] = (cx, cy, conf)  # nose
-    kp[1] = (cx + 8, cy - 6, conf)  # l_eye (image right when facing camera? any)
+    kp[1] = (cx + 8, cy - 6, conf)  # l_eye
     kp[2] = (cx - 8, cy - 6, conf)
     kp[3] = (cx + 18, cy - 2, conf)
     kp[4] = (cx - 18, cy - 2, conf)
@@ -172,6 +172,31 @@ def test_pose_clips_and_sanitises_keypoints():
     assert dets[0].keypoints[10, 2] == 0 and np.isfinite(dets[0].keypoints).all()
     hb = dets[0].head_box
     assert hb[0] >= 0 and hb[1] >= 0
+
+
+def test_pose_zeroed_keypoint_is_missing():
+    """ultralytics 8.3.0-8.3.140 report low-confidence keypoints as (0, 0, conf)."""
+    cfg = load_config(profile="fast")
+    frame = make_frame(w=1920, h=1080)
+    kp = face_keypoints(800, 220)
+    kp[3] = (0.0, 0.0, 0.40)  # left ear zeroed by ultralytics, conf above kpt_thr
+    body = [700, 150, 900, 1000]
+    dets = YoloPosePersons(cfg, model=FakeModel(pose_result([body], [0.9], [kp]))).detect(frame)
+    assert len(dets) == 1
+    d = dets[0]
+    assert d.keypoints[3, 2] == 0.0
+    expected_kp = kp.copy()
+    expected_kp[3, 2] = 0.0
+    expected = head_box_from_keypoints(
+        expected_kp, np.asarray(body, np.float32), (1920, 1080),
+        cfg.persons.kpt_thr, cfg.persons.head_scale,
+    )
+    np.testing.assert_allclose(d.head_box, expected)
+    hb = d.head_box
+    assert hb[0] > 0 and hb[1] > 0
+    face = kp[[0, 1, 2, 4], :2]
+    assert (face[:, 0] >= hb[0]).all() and (face[:, 0] <= hb[2]).all()
+    assert (face[:, 1] >= hb[1]).all() and (face[:, 1] <= hb[3]).all()
 
 
 def test_pose_head_box_fallbacks():

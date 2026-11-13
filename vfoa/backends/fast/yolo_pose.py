@@ -22,7 +22,7 @@ __all__ = ["YoloPosePersons", "head_box_from_keypoints"]
 
 log = logging.getLogger(__name__)
 
-_NOSE, _L_EYE, _R_EYE = 0, 1, 2
+_L_EYE, _R_EYE = 1, 2
 _L_SHOULDER, _R_SHOULDER = 5, 6
 
 
@@ -177,6 +177,14 @@ class YoloPosePersons(PersonBackend):
                 kp = kps[i].copy()
                 bad = ~np.isfinite(kp).all(axis=1)
                 kp[bad] = 0.0
+                # ultralytics 8.3.0-8.3.140 zero the x,y of every keypoint with
+                # confidence < 0.5 in Keypoints.__init__ but keep its confidence,
+                # and requirements-fast.txt allows ultralytics>=8.3. With
+                # persons.kpt_thr = 0.35 such a point would arrive as (0, 0, conf)
+                # and be used as real (head boxes stretched to the image origin).
+                # Mark it missing here so every consumer of the stored keypoints
+                # (eye pixel, head pose, tracking) is protected.
+                kp[(kp[:, 0] == 0) & (kp[:, 1] == 0), 2] = 0.0
             head = head_box_from_keypoints(kp, body, (width, height), kpt_thr, head_scale)
             out.append(PersonDetection(head_box=head, body_box=body, keypoints=kp, score=score))
         return out
