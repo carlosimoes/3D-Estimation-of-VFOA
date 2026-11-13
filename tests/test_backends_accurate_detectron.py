@@ -150,6 +150,10 @@ def test_imports_clean(cwd, module, attr):
 
 def test_create_and_unavailable(make_config, monkeypatch):
     monkeypatch.delenv("VFOA_THIRD_PARTY", raising=False)
+    # Force the missing-package condition so the test does not depend on
+    # whether detectron2 / OpenPose happen to be importable on this machine.
+    for name in ("detectron2", "detectron2.checkpoint", "lib", "lib.config.default"):
+        monkeypatch.setitem(sys.modules, name, None)
     cfg = make_config("accurate")
     persons = create_backend("persons", cfg)
     seg = create_backend("segmentation", cfg)
