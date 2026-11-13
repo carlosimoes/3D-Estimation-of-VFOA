@@ -19,13 +19,15 @@ class MapFramesOutputs:
 
     def appendMap(self, map):
         """
-        Appends a MapFramesOutputs to itself.
+        Appends a MapFramesOutputs to itself: its frame keys are shifted past the
+        current last key (never overwriting entries); person ids are unchanged.
         :param map:
-        :return:
+        :return: the frame-key offset applied
         """
-        currentLength = len(self.map)
+        offset = max(self.map) + 1 if self.map else 0
         for i, entry in map.map.items():
-            self.map[i + currentLength] = entry
+            self.map[i + offset] = entry
+        return offset
 
     def addGazes(self, gazesList):
         """
@@ -93,6 +95,14 @@ class MapFramesOutputs:
 
     def __len__(self):
         return len(self.map)
+
+    def __contains__(self, frame):
+        """True when ``frame`` is a frame key of the map."""
+        return frame in self.map
+
+    def __getitem__(self, frame):
+        """Detected instances of frame ``frame`` ({id: features})."""
+        return self.map[frame]
 
     def items(self):
         return self.map.items()
