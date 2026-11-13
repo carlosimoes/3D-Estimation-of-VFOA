@@ -1,0 +1,7 @@
+# "fast" real-time profile (YOLO11 pose / segmentation).
+-r requirements.txt
+torch
+# ultralytics is licensed AGPL-3.0. It is an OPTIONAL dependency: vfoa imports
+# it lazily, only inside vfoa/backends/fast/_ultra.py when a fast backend is
+# loaded. The rest of the package works without it.
+ultralytics>=8.3

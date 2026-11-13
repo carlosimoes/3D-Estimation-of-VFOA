@@ -1,0 +1,42 @@
+# Thesis profile: the thesis models AND the thesis-faithful (bug-fixed) algorithm
+# (greedy IoU tracking, static Gaze360 window, radius outliers, ray-cone attention
+# with the 45-degree agreement fusion, no occlusion, no temporal smoothing).
+profile: thesis
+
+depth:
+  backend: stereo_bm
+persons:
+  backend: openpose_densepose
+tracking:
+  type: greedy_iou
+  iou_thr: 0.5
+  max_age: 0
+headpose:
+  backend: fsanet
+gaze:
+  backend: gaze360
+  window: static
+segmentation:
+  backend: panoptic_fpn
+  stride: 1
+scene:
+  outlier: radius
+  ignore_labels: [wall]
+  point_stride: 1
+attention:
+  method: rays
+  fusion: agreement
+  occlusion: none
+smoothing:
+  direction: none
+  target: none
+
+# Commented knobs:
+# models:
+#   third_party_root: /path/to/detectron2   # or env VFOA_THIRD_PARTY
+# attention:
+#   rays:
+#     n: 20
+#     half_angles_gaze_deg: [11.3, 21.8]
+#     half_angles_head_deg: [12.5, 24.0]
+#   agreement_deg: 45.0

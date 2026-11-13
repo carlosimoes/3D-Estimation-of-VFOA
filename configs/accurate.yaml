@@ -1,0 +1,32 @@
+# Accurate profile: the original thesis models (StereoBM depth, OpenPose + DensePose,
+# FSA-Net, Gaze360, Panoptic FPN) with the improved attention algorithm.
+# Needs the third-party checkouts: set models.third_party_root or VFOA_THIRD_PARTY.
+profile: accurate
+
+depth:
+  backend: stereo_bm
+persons:
+  backend: openpose_densepose
+headpose:
+  backend: fsanet
+gaze:
+  backend: gaze360
+segmentation:
+  backend: panoptic_fpn
+  stride: 1
+
+# Commented knobs:
+# models:
+#   third_party_root: /path/to/detectron2   # or env VFOA_THIRD_PARTY
+#   device: auto
+# input:
+#   right_path: null          # rectified right view for stereo_bm
+# depth:
+#   num_disparities: 160
+#   block_size: 15
+#   wls: auto                 # needs opencv-contrib (cv2.ximgproc)
+# segmentation:
+#   stride: 1
+#   async: false
+# runtime:
+#   lookahead_frames: 0       # >= 3 * gaze window_step for a centred Gaze360 window
