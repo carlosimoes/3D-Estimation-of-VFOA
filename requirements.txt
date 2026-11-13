@@ -1,0 +1,7 @@
+# Core runtime dependencies of the vfoa package (geometry, attention, IO,
+# synthetic profile and the model-free parts of every profile).
+numpy>=1.24
+scipy
+opencv-python-headless
+pyyaml
+pillow

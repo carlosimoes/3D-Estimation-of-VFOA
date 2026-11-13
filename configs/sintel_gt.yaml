@@ -1,0 +1,16 @@
+# Fast profile on the repository's Sintel sample (bandage_2) with ground-truth depth.
+# Paths are relative to the repository root (run from there).
+profile: fast
+
+input:
+  path: Final_videos/mpi_sintel.mp4
+  camera_dir: Final_videos/stereo/camdata_left/bandage_2
+  depth_dir: Final_videos/stereo/training/bandage_2_depth
+depth:
+  backend: sintel_gt
+
+# Commented knobs:
+# camera:
+#   baseline_m: 0.1
+# segmentation:
+#   stride: 10
