@@ -16,6 +16,12 @@ from vfoa.backends.depth_stereo import StereoBMDepth, synthesize_right_view
 from vfoa.io.sintel import depth_read
 from vfoa.types import Frame, Intrinsics
 
+
+@pytest.fixture(autouse=True)
+def _no_ximgproc(monkeypatch):
+    """Pin the measured no-WLS path even where opencv-contrib provides ``cv2.ximgproc``."""
+    monkeypatch.delattr(cv2, "ximgproc", raising=False)
+
 _RIGHT_CACHE: dict = {}
 
 

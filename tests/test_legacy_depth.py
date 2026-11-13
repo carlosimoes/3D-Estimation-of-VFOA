@@ -15,6 +15,12 @@ import yaml
 from vfoa.backends.depth_stereo import synthesize_right_view
 
 
+@pytest.fixture(autouse=True)
+def _no_ximgproc(monkeypatch):
+    """Pin the measured no-WLS path even where opencv-contrib provides ``cv2.ximgproc``."""
+    monkeypatch.delattr(cv2, "ximgproc", raising=False)
+
+
 def _write_stereo_pngs(tmp_path, sintel_sample, n=3):
     dl, dr = tmp_path / "left", tmp_path / "right"
     dl.mkdir()
@@ -202,7 +208,7 @@ def test_midas_missing_raises_backend_unavailable(monkeypatch, tmp_path):
         dpm._midas()
 
 
-def test_legacy_modules_import_cleanly(repo_root):
+def test_legacy_modules_import_cleanly(repo_root, tmp_path):
     code = textwrap.dedent(
         """
         import importlib, sys
@@ -217,8 +223,10 @@ def test_legacy_modules_import_cleanly(repo_root):
         """
     )
     env = {k: v for k, v in os.environ.items() if not k.startswith("VFOA_")}
-    env["PYTHONPATH"] = os.pathsep.join([str(repo_root / "thesis_final"), str(repo_root)])
-    proc = subprocess.run([sys.executable, "-c", code], cwd=str(repo_root), env=env,
+    # Only thesis_final on the path and a neutral cwd: the vfoa package must be reached
+    # through ``import _bootstrap`` in the legacy modules, as scripts would.
+    env["PYTHONPATH"] = str(repo_root / "thesis_final")
+    proc = subprocess.run([sys.executable, "-c", code], cwd=str(tmp_path), env=env,
                           capture_output=True, text=True, timeout=300)
     assert proc.returncode == 0, proc.stderr
     assert "OK" in proc.stdout
