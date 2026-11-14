@@ -48,6 +48,7 @@ EXPECTED = {
     "gaze": {
         "gaze360": "vfoa.backends.accurate.gaze360:Gaze360Gaze",
         "head_proxy": "vfoa.backends.fast.head_proxy_gaze:HeadProxyGaze",
+        "l2cs": "vfoa.backends.fast.l2cs_gaze:BinnedGaze360Backend",
         "synthetic": "vfoa.backends.synthetic:SyntheticGaze",
     },
     "segmentation": {
@@ -109,7 +110,7 @@ def test_preregistered_names():
             assert REGISTRY[kind][name] == target
             assert isinstance(REGISTRY[kind][name], str)
     assert set(REGISTRY) == set(EXPECTED)
-    assert available("gaze") == ["gaze360", "head_proxy", "synthetic"]
+    assert available("gaze") == ["gaze360", "head_proxy", "l2cs", "synthetic"]
 
 
 class FakeDepth(DepthBackend):
@@ -166,7 +167,7 @@ def test_create_with_string_target(monkeypatch, tmp_path):
 
 
 def test_none_and_unknown():
-    cfg = load_config()  # gaze.backend == none
+    cfg = load_config(overrides=["gaze.backend=none"])
     assert create_backend("gaze", cfg) is None
     with pytest.raises(ValueError) as err:
         create_backend("depth", load_config(overrides=["depth.backend=nope"]))

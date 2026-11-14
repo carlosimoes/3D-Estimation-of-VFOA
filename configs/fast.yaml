@@ -1,5 +1,7 @@
 # Fast real-time profile (the defaults): YOLO11-pose persons + keypoint head pose,
-# YOLO11-seg segmentation every 10 frames, constant depth unless configured.
+# L2CS-style gaze (MobileOne-S0 ONNX, falls back to the head direction when the
+# model is unavailable), YOLO11-seg segmentation every 10 frames, constant depth
+# unless configured.
 # Usage: python -m vfoa run --config configs/fast.yaml --input VIDEO
 profile: fast
 
@@ -12,7 +14,19 @@ profile: fast
 #   imgsz: 640
 #   stride: 1
 # gaze:
-#   backend: none             # gaze360|head_proxy|synthetic|none
+#   backend: l2cs             # gaze360|l2cs|head_proxy|synthetic|none
+#   fallback: head_proxy      # used when l2cs is unavailable (no onnxruntime, no weights, offline)
+#   stride: 1                 # l2cs on CPU costs ~40-65 ms per person (MobileOne-S0 at 448 px):
+#                             # raise the stride (or use a GPU) for real-time runs
+#   l2cs:
+#     model: mobileone_s0     # mobileone_s0|resnet18|resnet34|resnet50|mobilenetv2
+#     path: null              # explicit ONNX file; null -> <weights_dir>/<model>_gaze.onnx
+#     download: true          # download from the MobileGaze GitHub release (needs models.allow_download)
+#     input_size: 448         # training size; 224 is ~4x cheaper, accuracy unknown
+#     kpt_thr: 0.5            # face gate: nose and one eye at least this confident, else head pose is used
+#     crop_margin: 1.1
+#     perspective_correction: false   # unverified; keep off until checked on ground truth
+#   # l2cs weights are trained on Gaze360: research / non-commercial use only; never commit them.
 # segmentation:
 #   stride: 10
 #   async: false

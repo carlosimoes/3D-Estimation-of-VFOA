@@ -32,6 +32,7 @@ FAST_MODULES = [
     "vfoa.backends.fast.keypoints_headpose",
     "vfoa.backends.fast.yolo_seg",
     "vfoa.backends.fast.head_proxy_gaze",
+    "vfoa.backends.fast.l2cs_gaze",
 ]
 
 
@@ -109,7 +110,8 @@ def test_import_hygiene_and_registry(repo_root):
     assert proc.returncode == 0, proc.stderr
     data = json.loads(proc.stdout.strip().splitlines()[-1])
     roots = {m.split(".")[0] for m in data["mods"]}
-    assert not roots & {"ultralytics", "torch", "torchvision"}, sorted(roots & {"ultralytics", "torch"})
+    forbidden = {"ultralytics", "torch", "torchvision", "onnxruntime"}
+    assert not roots & forbidden, sorted(roots & forbidden)
     assert data["backends"] == {
         "persons": ["YoloPosePersons", False],
         "headpose": ["KeypointHeadPose", False],

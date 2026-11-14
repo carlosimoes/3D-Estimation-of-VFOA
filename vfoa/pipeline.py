@@ -42,12 +42,22 @@ Real-time mode (:mod:`vfoa.realtime`, Refs #35):
   not part of ``FrameResult.timings_ms``. ``summary["async"]`` holds the
   runner statistics. Offline runs (both options false) are unchanged.
 
+Backend fallback: when ``cfg[kind].fallback`` is set (the fast profile sets
+``gaze.fallback: head_proxy`` for ``gaze.backend: l2cs``), the primary
+backend is loaded eagerly in ``open()``; if it is unavailable (missing
+package or weights) a warning is logged, the fallback backend is used and
+``pipeline.cfg`` becomes a copy with ``cfg[kind].backend = <fallback>`` and
+``cfg[kind].fallback_from = <primary>`` (so cache keys describe what really
+ran), and the counter ``<kind>_fallback`` is set. Such kinds skip the
+"served from complete cache, model not loaded" shortcut.
+
 All 3D quantities are in the camera frame of the left camera (metres, +Z
 forward); times are seconds (``frame.index / fps``).
 """
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import logging
 import time
@@ -56,7 +66,7 @@ from collections import deque
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from vfoa.attention import AttentionParams, score_frame
-from vfoa.backends import KINDS, create_backend
+from vfoa.backends import KINDS, create_backend_with_fallback
 from vfoa.backends.base import Backend
 from vfoa.cache import StageCache, cache_root, stage_key, stage_meta
 from vfoa.io.sources import open_source
@@ -172,6 +182,8 @@ class Pipeline:
         timer: Optional[StageTimer] = None,
     ) -> None:
         self.cfg = cfg
+        self._base_cfg = cfg
+        self._derived_cfg: Optional[Mapping[str, Any]] = None
         self._injected: dict[str, Optional[Backend]] = dict(backends or {})
         unknown = set(self._injected) - set(KINDS)
         if unknown:
@@ -208,7 +220,10 @@ class Pipeline:
         return self
 
     def _open(self, fps: Optional[float], fingerprint: Optional[str]) -> None:
-        cfg = self.cfg
+        if self.cfg is not self._derived_cfg:  # the user's config (not one rewritten by a fallback)
+            self._base_cfg = self.cfg
+        cfg = self.cfg = self._base_cfg
+        self._derived_cfg = None
         self.fps = float(fps) if fps is not None and fps > 0 else 30.0
         self.timer.reset()
         self._latency = StageTimer(enabled=self.timer.enabled)
@@ -221,7 +236,18 @@ class Pipeline:
             if kind in self._injected:
                 backends[kind] = self._injected[kind]
             else:
-                b = create_backend(kind, cfg)
+                t0 = time.perf_counter()
+                b, used = create_backend_with_fallback(kind, cfg)
+                if b is not None and b.is_loaded:
+                    self.timer.add_setup(f"load:{kind}", time.perf_counter() - t0)
+                if used is not None:
+                    cfg = copy.deepcopy(cfg)
+                    cfg[kind]["fallback_from"] = cfg[kind].get("backend")
+                    cfg[kind]["backend"] = used
+                    self.cfg = self._derived_cfg = cfg
+                    if b is not None:
+                        b.cfg = cfg
+                    self.timer.count(f"{kind}_fallback")
                 backends[kind] = b
                 if b is not None:
                     self._owned.add(kind)

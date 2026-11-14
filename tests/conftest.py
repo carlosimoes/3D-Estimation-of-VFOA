@@ -3,6 +3,8 @@
 Fixtures: repo_root, sintel_paths, sintel_sample(index=1), tiny_video(...),
 make_config(profile="synthetic", overrides=None), rng.
 Markers: ``slow`` and ``network`` (network tests run only with VFOA_RUN_NETWORK=1).
+Autouse: ``_no_weight_downloads`` makes the l2cs weight download fail (except in
+``network`` tests).
 Models are always faked; tests never download and never need a GPU.
 """
 
@@ -34,6 +36,20 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list) -> None:
     for item in items:
         if "network" in item.keywords:
             item.add_marker(skip)
+
+
+@pytest.fixture(autouse=True)
+def _no_weight_downloads(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fast profile loads the l2cs gaze backend: never let it download weights in tests
+    (tests marked ``network`` are exempt)."""
+    if "network" in request.keywords:
+        return
+    from vfoa.backends.fast import l2cs_gaze
+
+    def _refuse(url, target, *a, **k):
+        raise OSError(f"network disabled in tests (would download {url})")
+
+    monkeypatch.setattr(l2cs_gaze, "_download", _refuse)
 
 
 @pytest.fixture(scope="session")

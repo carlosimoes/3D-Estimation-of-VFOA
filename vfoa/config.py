@@ -168,7 +168,8 @@ DEFAULTS: dict = {
         ],
     },
     "gaze": {
-        "backend": "none",  # gaze360|head_proxy|synthetic|none
+        "backend": "none",  # gaze360|l2cs|head_proxy|synthetic|none (the fast profile: l2cs)
+        "fallback": None,  # backend used when `backend` is unavailable (fast profile: head_proxy)
         "stride": 1,
         "phase": 0,
         "max_hold_frames": 15,
@@ -179,6 +180,20 @@ DEFAULTS: dict = {
         "weights": "gaze360/gaze360_model.pth.tar",
         "batch_size": 16,
         "proxy_confidence": 0.5,
+        # l2cs: L2CS-style binned gaze on ONNX Runtime (vfoa/backends/fast/l2cs_gaze.py).
+        # Weights are Gaze360-trained (research/non-commercial) and never committed.
+        "l2cs": {
+            "model": "mobileone_s0",  # mobileone_s0|resnet18|resnet34|resnet50|mobilenetv2
+            "path": None,  # explicit ONNX file; null -> <weights_dir>/<model>_gaze.onnx
+            "url": None,  # null -> the built-in MobileGaze release URL of `model`
+            "sha256": None,  # null -> the built-in hash (when known) of the built-in URL
+            "download": True,  # also needs models.allow_download
+            "input_size": 448,  # training size; a fixed-size model overrides it
+            "kpt_thr": 0.5,  # gate: nose and at least one eye at or above this confidence
+            "crop_margin": 1.1,
+            "perspective_correction": False,  # rotate by the camera ray through the face (unverified)
+            "providers": None,  # null -> CUDA (if available and models.device != cpu), else CPU
+        },
     },
     "segmentation": {
         "backend": "yolo_seg",  # panoptic_fpn|yolo_seg|synthetic|none
@@ -314,7 +329,7 @@ def _deep_merge(base: Mapping, override: Mapping) -> dict:
 
 
 PROFILES: dict = {
-    "fast": {},
+    "fast": {"gaze": {"backend": "l2cs", "fallback": "head_proxy"}},
     "accurate": _deep_merge({}, _ACCURATE),
     "thesis": _deep_merge(_ACCURATE, _THESIS_EXTRA),
     "synthetic": {
