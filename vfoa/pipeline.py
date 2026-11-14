@@ -441,10 +441,13 @@ class Pipeline:
         # segmentation (sync or async runner)
         if self.backends.get("segmentation") is not None:
             if self._due("segmentation", i):
-                with timer.stage("segmentation") if self._seg_async else _null():
-                    accepted = self._runner.submit(frame)
+                t0 = time.perf_counter()
+                accepted = self._runner.submit(frame)
                 if accepted:
                     self._last["segmentation"] = i
+                    if self._seg_async:
+                        # only accepted submissions count as segmentation runs
+                        timer.add("segmentation", time.perf_counter() - t0)
             got = self._runner.poll()
             if got is not None:
                 self._seg = got[1]
@@ -522,7 +525,9 @@ class Pipeline:
                 logger.exception("closing the segmentation runner failed")
             self._runner = None
         for c in self.caches.values():
-            c.close(complete=complete)
+            # never demote a cache that was complete and received no new frame
+            # (StageCache.complete turns False on any put() or dropped chunk)
+            c.close(complete=complete or c.complete)
         for kind in sorted(self._owned):
             b = self.backends.get(kind)
             if b is not None:
@@ -543,6 +548,8 @@ class Pipeline:
             stage: {"key": c.key, "mode": c.mode, **self._cache_stats.get(stage, {})}
             for stage, c in self.caches.items()
         }
+        # frames still waiting in the lookahead buffer were never finalised
+        complete = complete and not getattr(self, "_pending", None)
         self._close_resources(complete)
         for stage, c in self.caches.items():
             caches[stage]["complete"] = bool(c.complete)
@@ -610,13 +617,3 @@ class Pipeline:
                 if callable(close):
                     close()
         return summary
-
-
-class _null:
-    """No-op context manager."""
-
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(self, *exc: Any) -> None:
-        return None

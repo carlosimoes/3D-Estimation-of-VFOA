@@ -257,6 +257,77 @@ def test_cache_rescoring_without_models(make_config, tmp_path):
     assert comparable(res3) == comparable(res1)
 
 
+class RaisingSink(ListSink):
+    def __init__(self, at: int) -> None:
+        super().__init__()
+        self.at = at
+
+    def write(self, frame: Any, result: Any) -> None:
+        if result.index == self.at:
+            raise KeyboardInterrupt("simulated interrupt")
+        super().write(frame, result)
+
+
+def _meta_complete(cache_dir) -> dict:
+    out = {}
+    for meta in sorted(cache_dir.glob("*/meta.json")):
+        m = json.loads(meta.read_text())
+        out[m["stage"]] = bool(m["complete"])
+    return out
+
+
+def test_interrupted_replay_keeps_caches_complete(make_config, tmp_path):
+    cache_dir = tmp_path / "cache"
+    base = {"input": {"max_frames": 40}, "cache": {"enabled": True, "dir": str(cache_dir)}}
+    cfg = make_config("synthetic", base)
+
+    # an interrupted FIRST run leaves its caches incomplete
+    first_dir = tmp_path / "first"
+    cfg0 = make_config("synthetic", merge(base, {"cache": {"dir": str(first_dir)}}))
+    pipe0 = Pipeline(cfg0, backends=fakes(cfg0))
+    with pytest.raises(KeyboardInterrupt):
+        pipe0.run(open_input(cfg0), [RaisingSink(5)])
+    assert _meta_complete(first_dir) == {s: False for s in MODEL_STAGES}
+
+    # full cached run, then an interrupted readwrite replay that writes nothing
+    _, sum1, _ = run_cfg(cfg, fakes(cfg))
+    assert all(c["complete"] for c in sum1["cache"].values())
+    pipe2 = Pipeline(cfg, backends=fakes(cfg))
+    with pytest.raises(KeyboardInterrupt):
+        pipe2.run(open_input(cfg), [RaisingSink(5)])
+    assert _meta_complete(cache_dir) == {s: True for s in MODEL_STAGES}
+
+    # read mode with fresh fakes: no model loaded or called
+    cfg3 = make_config("synthetic", merge(base, {"cache": {"mode": "read"}}))
+    bk3 = fakes(cfg3)
+    res3, sum3, _ = run_cfg(cfg3, bk3)
+    assert len(res3) == 40
+    for b in bk3.values():
+        assert b.loaded == 0 and b.calls == 0
+    assert bk3["gaze"].observed == 0
+    assert all(c["misses"] == 0 for c in sum3["cache"].values())
+    assert not any(k.startswith("load:") for k in sum3["setup_ms"])
+
+
+@pytest.mark.parametrize("do_flush", [False, True])
+def test_close_with_pending_lookahead_not_complete(make_config, tmp_path, do_flush):
+    n, L = 30, 6
+    cfg = make_config("synthetic", {
+        "runtime": {"lookahead_frames": L},
+        "cache": {"enabled": True, "dir": str(tmp_path / "cache")},
+    })
+    world = SyntheticWorld.from_config(cfg)
+    pipe = Pipeline(cfg, backends=fakes(cfg)).open(world.fps, "synthetic:pending-test")
+    for i in range(n):
+        pipe.process(world.frame(i))
+    if do_flush:
+        assert len(pipe.flush()) == L
+    summary = pipe.close()
+    for stage in ("depth", "headpose", "gaze", "segmentation"):
+        assert summary["cache"][stage]["complete"] is do_flush
+    assert _meta_complete(tmp_path / "cache")["depth"] is do_flush
+
+
 # ---------------------------------------------------------------------- lookahead
 class RecordingGaze(SyntheticGaze):
     def __init__(self, cfg):

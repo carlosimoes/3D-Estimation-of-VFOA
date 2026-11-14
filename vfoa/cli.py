@@ -27,8 +27,6 @@ from typing import Any, Optional, Sequence
 
 __all__ = ["build_parser", "config_from_args", "build_sinks", "main"]
 
-logger = logging.getLogger(__name__)
-
 
 def build_parser() -> argparse.ArgumentParser:
     """Argument parser of the ``vfoa`` command."""
