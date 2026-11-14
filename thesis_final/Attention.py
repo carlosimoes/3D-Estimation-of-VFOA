@@ -1,172 +1,189 @@
+"""Legacy thesis attention API (thin wrapper over :mod:`vfoa.attention`).
+
+All public names of the thesis module are kept; the geometry and scoring live
+once in :mod:`vfoa.attention` / :mod:`vfoa.geometry`. Fixed relative to the
+thesis: rays only count in front of the eyes (#5), ``calc_ratio`` uses
+``bbox[0] - bbox[1]`` (#4), the gaze/head weights no longer cancel - per-cue
+scores are normalised to [0, 1] first and ``total_Attention`` is their weighted
+mean (#3), missing cues give ``None`` instead of KeyError (#14), and a person's
+own object (optional key ``"own"``) is skipped (#6).
+
+Boxes are ``bbox = [max_bound, min_bound]`` in camera-frame units.
+"""
+
+from __future__ import annotations
+
+import _bootstrap  # noqa: F401  (adds the repo root to sys.path)
+
+from typing import Any, Optional
+
 import numpy as np
 
-def vect2cone(X0, X1,R,n):
-    vector=np.array(X1)-np.array(X0)
-    length_cone = np.linalg.norm(vector)
-    t = np.linspace(0,2*np.pi, n)
-    xx = R*np.cos(t)
-    yy = R*np.sin(t)
+from Arrow_line import vect2cone
+from vfoa.attention import (
+    AttentionParams,
+    agreement_weights,
+    box_ratio,
+    ray_box_values,
+    rays_score,
+)
+from vfoa.geometry import cone_rays, normalize, ray_aabb
 
-    unit_Vx= np.array([1,0,0])
-    angle_X0X1=np.arccos(np.dot(unit_Vx,vector)/(np.linalg.norm(unit_Vx)*length_cone))*180/np.pi
+__all__ = [
+    "vect2cone",
+    "intersection",
+    "inside_box",
+    "distance",
+    "calcangle2value",
+    "calc_intersection_points",
+    "CalcAttention",
+    "calc_ratio",
+    "calc_normalize_Attention",
+    "Attention",
+]
 
-    axis_rot=np.cross(unit_Vx,vector)
 
-    u=axis_rot/np.linalg.norm(axis_rot)
+def intersection(maximo, minimo, dir_inv, origin):
+    """Slab test of one ray (given by its inverse direction) against one box.
 
-    alpha=angle_X0X1*np.pi/180
-    cosa = np.cos(alpha)
-    sina = np.sin(alpha)
-    vera = 1 - cosa
-    x = u[0]
-    y = u[1]
-    z = u[2]
-    rot = np.array([[cosa+x**2*vera, x*y*vera-z*sina, x*z*vera+y*sina], 
-        [x*y*vera+z*sina, cosa+y**2*vera, y*z*vera-x*sina],
-        [x*z*vera-y*sina, y*z*vera+x*sina, cosa+z**2*vera]]).transpose()
+    Returns ``(entry_point, exit_point)`` or ``(False, False)`` when the ray
+    misses or the box is behind ``origin``. Infinite/zero entries of
+    ``dir_inv`` mean a zero direction component.
+    """
+    inv = np.asarray(dir_inv, dtype=np.float64).reshape(3)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        d = np.where(np.isfinite(inv) & (inv != 0), 1.0 / np.where(inv != 0, inv, 1.0), 0.0)
+    o = np.asarray(origin, dtype=np.float64).reshape(3)
+    hit, t_in, t_out = ray_aabb(o, d, np.asarray(minimo, float), np.asarray(maximo, float))
+    if not bool(hit[0, 0]):
+        return (False, False)
+    return (o + t_in[0, 0] * d, o + t_out[0, 0] * d)
 
-    aux=[length_cone]*xx.size
-    origin_ref=np.array([0,0,0])
-    newxyz = np.array([np.array(aux)-origin_ref[0],xx-origin_ref[1],yy-origin_ref[2]]).transpose()
 
-    newxyz = np.matmul(newxyz,rot)
-    newxyz= newxyz + origin_ref
-    cone_vect=newxyz-origin_ref
-    return(cone_vect)
+def inside_box(maximo, minimo, point) -> bool:
+    """Whether ``point`` lies inside the box ``[minimo, maximo]`` (bounds included)."""
+    p = np.asarray(point, dtype=np.float64).reshape(3)
+    lo = np.minimum(np.asarray(minimo, float), np.asarray(maximo, float))
+    hi = np.maximum(np.asarray(minimo, float), np.asarray(maximo, float))
+    return bool(np.all(p >= lo) and np.all(p <= hi))
 
-def intersection(maximo, minimo, dir_inv, origin) :
-    t1 = (minimo[0] - origin[0])*dir_inv[0]
-    t2 = (maximo[0] - origin[0])*dir_inv[0]
-
-    tmin = min(t1, t2)
-    tmax = max(t1, t2)
-
-    for i in range(0,3):
-        t1 = (minimo[i] - origin[i])*dir_inv[i]
-        t2 = (maximo[i] - origin[i])*dir_inv[i]
-
-        tmin = max(tmin, min(t1, t2))
-        tmax = min(tmax, max(t1, t2))
-
-    if tmax > tmin :
-        point = tmin * 1/dir_inv + origin
-        point2 = tmax * 1/dir_inv + origin
-        return (point, point2)
-    else:
-        return(False, False)
-
-def inside_box(maximo, minimo, point):
-    if point[0] <= maximo[0] and point[0] >= minimo[0]:
-        if point[1] <= maximo[1] and point[1] >= minimo[1]:
-            if point[2] <= maximo[2] and point[2] >= minimo[2]:
-                return(True)
-            else:
-                return(False)
-        else:
-            return(False)
-    else:
-        return(False)
 
 def distance(center_box, point):
-    squared_dist = np.sum((point-center_box)**2, axis=0)
-    dist = np.sqrt(squared_dist)
-    return(dist)
+    """Euclidean distance between two points."""
+    return np.linalg.norm(np.asarray(point, float) - np.asarray(center_box, float), axis=0)
+
 
 def calcangle2value(vectgaze, vecthead):
-    """ Returns the angle in radians between vectors 'vectgaze' and 'vecthead'
+    """Thesis weights [gaze, head]: [1.9, 1.1] if the vectors are < 45 degrees apart, else [1.55, 1.45]."""
+    return list(agreement_weights(np.asarray(vectgaze, float), np.asarray(vecthead, float)))
 
-    all of the other answers here will fail if the two vectors have either 
-    the same direction (ex, (1, 0, 0), (1, 0, 0)) or opposite directions 
-    (ex, (-1, 0, 0), (1, 0, 0)).
-
-    """
-    vectgaze_unit = vectgaze / np.linalg.norm(vectgaze)
-    vecthead_unit = vecthead / np.linalg.norm(vecthead)
-    angle=np.degrees(np.arccos(np.clip(np.dot(vectgaze_unit, vecthead_unit), -1.0, 1.0)))
-
-    # Information that defines the intersection between the Gaze and Head Pose given values to each:[in:[gaze, head], out:[gaze, head]]
-    if angle < 45: 
-        # IF intersection exist weights for Gaze and Head Pose
-        diffG_HP=[1.9, 1.1]
-    else:
-        # If the intersection doesnt exist weights for Gaze and Head Pose
-        diffG_HP=[1.55, 1.45]
-
-    return diffG_HP
 
 def calc_intersection_points(vects_gaze, bbox, origin):
-    #TODO: Distance to origin from intersection point -> Normalization
-    list_dist=[]
-    centerbox=(bbox[0]+bbox[1])/2
-    dist_max=distance(centerbox, bbox[0])
-    for vect_gaze in vects_gaze:
-        point1, point2 = intersection(bbox[0], bbox[1],np.float64(1)/vect_gaze, origin) # maximo, minimo, np.float64(1)/dir_inv, origin
-        if type(point1) != bool and inside_box(bbox[0], bbox[1],point1):
-            dist = distance(center_box = centerbox, point=point1)
-            dist_O = distance(center_box = origin, point=point1)
-            dist=dist/dist_max  # normalization
-            list_dist.append(1.5-dist)  #1.5: because we want some attention even when the dist is max-out 
-        elif type(point2) != bool and inside_box(bbox[0], bbox[1],point2):
-            dist = distance(center_box = centerbox, point=point2)
-            dist_O = distance(center_box = origin, point=point2)
-            dist=dist/dist_max
-            list_dist.append(1.5-dist)
-        else:
-            list_dist.append(0) # 0 represent that the ray doesnt even touch the box --> no attention
-    return(list_dist)
+    """Per-ray thesis value ``1.5 - |entry - centre| / half_diagonal`` (0 when the ray misses)."""
+    rays = np.asarray(vects_gaze, dtype=np.float64).reshape(-1, 3)
+    values, _, _ = ray_box_values(np.asarray(origin, float).reshape(3), rays, bbox[1], bbox[0])
+    return values[:, 0].tolist()
 
-def CalcAttention(list_inter, angles, type_gaze): #TODO: Multiplication
-    """ Returns the values of Attention having in account the intersection between the 'Gaze' and 'Head Pose' """
-    list_inter=np.array(list_inter)
-    if type_gaze:
-        result= list_inter * angles[0]
-    else:
-        result= list_inter * angles[1]
-    final_result=np.sum(result)
-    return final_result
 
-def calc_ratio(bbox):
-    min_dist_box=(min(abs([0]-bbox[1])))/2
-    centerbox=(bbox[0]+bbox[1])/2
-    dist_max=distance(centerbox, bbox[0])
-    return (min_dist_box/dist_max)
+def CalcAttention(list_inter, angles, type_gaze):
+    """Sum of the per-ray values times the gaze (``type_gaze`` truthy) or head weight."""
+    list_inter = np.array(list_inter, dtype=np.float64)
+    w = angles[0] if type_gaze else angles[1]
+    return float(np.sum(list_inter * w))
 
-def calc_normalize_Attention(valueAttention, number_rays, dist_ratio,angles,gaze_or_head):
-    if gaze_or_head:
-        return(valueAttention /(number_rays*(1.5-(dist_ratio))* angles[0])) 
-    else:
-        return(valueAttention /(number_rays*(1.5-(dist_ratio))* angles[1])) 
-    
+
+def calc_ratio(bbox) -> float:
+    """Min half-extent over half diagonal of ``bbox = [max, min]`` (translation invariant)."""
+    return float(box_ratio(bbox[1], bbox[0])[0])
+
+
+def calc_normalize_Attention(valueAttention, number_rays, dist_ratio, angles, gaze_or_head):
+    """Cue score in [0, 1]: the weight applied by :func:`CalcAttention` is divided out here."""
+    w = float(angles[0] if gaze_or_head else angles[1])
+    if w == 0 or not np.isfinite(w):
+        return 0.0
+    return rays_score(float(valueAttention) / w, number_rays, dist_ratio)
+
+
+def _vec3(v: Any) -> Optional[np.ndarray]:
+    if v is None:
+        return None
+    a = np.asarray(v, dtype=np.float64).reshape(-1)
+    if a.shape != (3,) or not np.isfinite(a).all():
+        return None
+    return a
+
+
+def _cue(person: dict, dkey: str, rkey: str, half_angles, n: int):
+    """``(direction, rays)`` of one cue, or ``(None, None)`` when unavailable."""
+    d = _vec3(person.get(dkey))
+    if d is not None and np.linalg.norm(d) <= 1e-12:
+        d = None
+    rays = person.get(rkey)
+    r = None
+    if rays is not None and np.size(rays) > 0:
+        r = np.asarray(rays, dtype=np.float64).reshape(-1, 3)
+        r = r[np.isfinite(r).all(axis=1) & (np.linalg.norm(r, axis=1) > 1e-12)]
+        if r.shape[0] == 0:
+            r = None
+    if r is None and d is not None:
+        r = np.concatenate([cone_rays(d, a, n) for a in half_angles], axis=0)
+    if d is None and r is not None:
+        m = normalize(r).mean(axis=0)
+        d = m if np.linalg.norm(m) > 1e-12 else None
+    if r is None:
+        return None, None
+    return d, r
+
+
 def Attention(ListPerson, ListObject):
-    dici_attention={}
-    for id_person in ListPerson.keys():
-        angle=calcangle2value(ListPerson[id_person]["g"],ListPerson[id_person]["hp"])
+    """Thesis attention dictionary.
 
-        dici_value={}
-        dici_object={}
-
-        for id_object in ListObject.keys():
-            dist_ratio=calc_ratio(ListObject[id_object]["bbox"])
-            #! ATTEntion for GAZE
-            list_inter=calc_intersection_points(ListPerson[id_person]["vg"], ListObject[id_object]["bbox"], ListPerson[id_person]["eyes"]) #? [box.max, box.min]
-            valueAttention=CalcAttention(list_inter,angle,1)
-            dici_value["object"]= ListObject[id_object]["name"]
-            dici_value["attentionG"]= list_inter
-            norm_valueAttention=calc_normalize_Attention(valueAttention, len(ListPerson[id_person]["vg"]), dist_ratio, angle, 1)
-            dici_value["total_Attention_G"]=norm_valueAttention #valueAttention (replace after test)
-            #! ATTEntion for HEADPOSE
-            list_inter_hp=calc_intersection_points(ListPerson[id_person]["vhp"], ListObject[id_object]["bbox"], ListPerson[id_person]["eyes"]) #? [box.max, box.min]
-            valueAttention=CalcAttention(list_inter_hp,angle,0)
-            dici_value["attentionH"]= list_inter_hp
-            norm_valueAttention=calc_normalize_Attention(valueAttention, len(ListPerson[id_person]["vhp"]), dist_ratio, angle, 0)
-            dici_value["total_Attention_H"]= norm_valueAttention #valueAttention (replace after test)
-            dici_value["total_Attention"]=dici_value["total_Attention_G"] + dici_value["total_Attention_H"]
-            dici_object[id_object]=dici_value
-            dici_value={}
-        
-        dici_attention[id_person]=dici_object
-    return(dici_attention)
-    
+    ``ListPerson``: ``{id: {"eyes": (3,), "g": vec, "hp": vec, "vg": rays, "vhp": rays,
+    "own": object id to skip}}`` (every key optional). ``ListObject``:
+    ``{id: {"name": str, "bbox": [max_bound, min_bound]}}``. Returns
+    ``{person_id: {object_id: {"object", "attentionG", "total_Attention_G",
+    "attentionH", "total_Attention_H", "total_Attention"}}}``; missing parts are None.
+    """
+    params = AttentionParams()
+    result = {}
+    for id_person, person in (ListPerson or {}).items():
+        person = person or {}
+        eyes = _vec3(person.get("eyes"))
+        gd, gr = _cue(person, "g", "vg", params.half_angles_gaze_deg, params.rays_n)
+        hd, hr = _cue(person, "hp", "vhp", params.half_angles_head_deg, params.rays_n)
+        if gd is not None and hd is not None:
+            angle = calcangle2value(gd, hd)
+        else:
+            angle = [1.0, 1.0]
+        own = person.get("own")
+        dici_object = {}
+        for id_object, obj in (ListObject or {}).items():
+            if own is not None and id_object == own:
+                continue
+            bbox = [np.asarray(obj["bbox"][0], float), np.asarray(obj["bbox"][1], float)]
+            ratio = calc_ratio(bbox)
+            entry: dict = {"object": obj.get("name")}
+            totals = []
+            for key, rays, flag in (("G", gr, 1), ("H", hr, 0)):
+                if eyes is None or rays is None:
+                    entry["attention" + key] = None
+                    entry["total_Attention_" + key] = None
+                    continue
+                inter = calc_intersection_points(rays, bbox, eyes)
+                value = CalcAttention(inter, angle, flag)
+                score = calc_normalize_Attention(value, len(inter), ratio, angle, flag)
+                entry["attention" + key] = inter
+                entry["total_Attention_" + key] = score
+                totals.append((angle[0] if flag else angle[1], score))
+            if not totals:
+                entry["total_Attention"] = None
+            else:
+                wsum = sum(w for w, _ in totals)
+                entry["total_Attention"] = sum(w * s for w, s in totals) / wsum
+            dici_object[id_object] = entry
+        result[id_person] = dici_object
+    return result
 
 
 if __name__ == "__main__":
