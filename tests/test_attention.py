@@ -331,6 +331,100 @@ def test_issue20_not_occluded_by_own_head():
     assert out[(0, 1)].occluded and out[(0, 1)].score_total == 0.0
 
 
+def _torso_scene():
+    """Person at eyes (0,0,2) looking away from the camera, sideways past their own torso."""
+    intr = Intrinsics.from_hfov(640, 360, 90.0)
+    eyes = np.array([0.0, 0.0, 2.0])
+    torso = _box_obj(10, [0, 0.55, 2.0], [0.15, 0.55, 0.15], label="person")
+    target = _box_obj(1, [1.0, 0.2, 4.0], 0.3)
+    head_box = np.array([intr.cx - 20, intr.cy - 30, intr.cx + 20, intr.cy + 3])
+    # body box wider than the torso segment (e.g. spread arms), as detectors produce
+    body_box = np.array([intr.cx - 100, intr.cy - 30, intr.cx + 100, intr.cy + 200])
+    return intr, eyes, torso, target, head_box, body_box
+
+
+def test_issue20_body_box_fallback_when_own_segment_unknown():
+    intr, eyes, torso, target, head_box, body_box = _torso_scene()
+    torso_full = _box_obj(10, [0, 0.55, 2.0], [0.6, 0.55, 0.15], label="person")
+    depth, seg = _paint(intr, [torso_full, target])
+    d = _unit(target.centroid - eyes)
+    prm = _params(occlusion="depth")
+    objs = [target]  # own object unknown: not in the object list
+    for segmentation in (seg, None):
+        p = _person(0, eyes, d, d, head_box=head_box, body_box=body_box)
+        out = _by_pair(score_frame([p], objs, prm, depth=depth, segmentation=segmentation))
+        assert not out[(0, 1)].occluded and out[(0, 1)].score_total > 0.9
+        control = _person(0, eyes, d, d, head_box=head_box)
+        out = _by_pair(score_frame([control], objs, prm, depth=depth, segmentation=segmentation))
+        assert out[(0, 1)].occluded and out[(0, 1)].score_total == 0.0
+
+
+def test_issue20_body_box_ignored_when_own_segment_known():
+    intr, eyes, torso, target, head_box, body_box = _torso_scene()
+    d = _unit(target.centroid - eyes)
+    prm = _params(occlusion="depth")
+    # occluder on the sight line, beside the torso but inside the body box in the image
+    occ = _box_obj(5, eyes + 0.6 * (target.centroid - eyes), [0.15, 0.15, 0.02])
+    p = _person(0, eyes, d, d, own=10, head_box=head_box, body_box=body_box)
+    uv = intr.project(occ.centroid)
+    assert body_box[0] <= uv[0] <= body_box[2] and body_box[1] <= uv[1] <= body_box[3]
+    depth, seg = _paint(intr, [torso, target, occ])
+    out = _by_pair(score_frame([p], [torso, target, occ], prm, depth=depth, segmentation=seg))
+    assert out[(0, 1)].occluded and out[(0, 1)].score_total == 0.0
+    depth, seg = _paint(intr, [torso, target])
+    out = _by_pair(score_frame([p], [torso, target], prm, depth=depth, segmentation=seg))
+    assert not out[(0, 1)].occluded and out[(0, 1)].score_total > 0.9
+
+
+def _synthetic_scene(world, i):
+    seg = world.segmentation(i)
+    objs = []
+    for s in seg.segments:
+        box = world.aabb(i, s.id)
+        if box is None:
+            continue
+        c = np.asarray(world.center(i, s.id), dtype=np.float64)
+        objs.append(SceneObject(
+            object_id=s.id, segment_id=s.id, label=s.label, is_thing=True,
+            aabb_min=np.asarray(box[0], float), aabb_max=np.asarray(box[1], float), centroid=c,
+            points=c[None].astype(np.float32), n_points=1,
+        ))
+    persons = [
+        Person(track_id=k, detection=det,
+               gaze=DirectionEstimate(np.asarray(world.gaze(i, k), float)),
+               head=DirectionEstimate(np.asarray(world.head(i, k), float)),
+               eyes_3d=np.asarray(world.eye_point(i, k), float),
+               own_object_id=world.person_segment_id(k))
+        for k, det in enumerate(world.detections(i))
+    ]
+    return persons, objs, world.depth(i), seg
+
+
+@pytest.mark.parametrize("n_persons,n_objects", [(2, 4), (3, 5)])
+def test_issue20_depth_occlusion_synthetic_world_regression(n_persons, n_objects):
+    from vfoa.backends.synthetic import SyntheticWorld
+
+    for occluder in (True, False):
+        world = SyntheticWorld(occluder=occluder, n_persons=n_persons, n_objects=n_objects)
+        frames = [i for i in range(world.n_frames) if world.phase(i) == 0][:3]
+        assert len(frames) >= 2
+        for i in frames:
+            persons, objs, depth, seg = _synthetic_scene(world, i)
+            scores = score_frame(persons, objs, AttentionParams(), depth=depth, segmentation=seg)
+            pairs = _by_pair(scores)
+            targets = best_targets(scores, 0.1)
+            truth = world.truth(i)
+            if occluder:
+                assert pairs[(0, 1)].occluded is True and pairs[(0, 1)].score_total == 0.0
+                assert targets[0] == world.panel_id == truth[0]
+            else:
+                aim = world.aim(i)
+                for k in range(n_persons):
+                    assert targets.get(k) == truth[k]
+                    if aim[k] is not None:
+                        assert not pairs[(k, aim[k])].occluded
+
+
 # --------------------------------------------------------------------------- fusion
 
 

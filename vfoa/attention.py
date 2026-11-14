@@ -401,8 +401,15 @@ def _rays(eyes, D, has, bmin, bmax, is_thing, pair_ok, params):
 
 
 def _depth_occlusion(eyes, T, persons, objs, own_idx, depth, segmentation, params):
-    """``(P,B)`` flags: the depth map is nearer than the eye->target segment."""
-    P, B = T.shape[:2]
+    """``(P,B)`` flags: the depth map is nearer than the eye->target segment.
+
+    Samples whose pixel shows the target's segment, the person's own segment
+    or lies inside the person's ``detection.head_box`` never block. The
+    person's ``detection.body_box`` is excluded only as a fallback when the
+    own segment is unknown (no segmentation, no own object, or own object
+    ``segment_id <= 0``): when the own segment is labelled, a real occluder
+    overlapping the full-person box must still count.
+    """
     dmap = np.asarray(depth.depth, dtype=np.float64)
     valid = np.asarray(depth.valid, dtype=bool)
     H, W = dmap.shape
@@ -422,6 +429,7 @@ def _depth_occlusion(eyes, T, persons, objs, own_idx, depth, segmentation, param
     blocked = usable & (s[..., 2] - np.where(usable, z_map, 0.0) > params.occlusion_margin_m)
 
     excluded = np.zeros_like(blocked)
+    own_known = np.zeros(len(persons), dtype=bool)
     if segmentation is not None:
         lm = np.asarray(segmentation.label_map)
         Hl, Wl = lm.shape[:2]
@@ -437,9 +445,15 @@ def _depth_occlusion(eyes, T, persons, objs, own_idx, depth, segmentation, param
         )  # (P,)
         excluded |= (lab == tseg[None, :, None]) & (tseg[None, :, None] > 0)
         excluded |= (lab == oseg[:, None, None]) & (oseg[:, None, None] > 0)
+        own_known = oseg > 0
     for p, person in enumerate(persons):
         det = person.detection
-        for box in (None if det is None else det.head_box, None if det is None else det.body_box):
+        if det is None:
+            continue
+        boxes = [det.head_box]
+        if not own_known[p]:
+            boxes.append(det.body_box)
+        for box in boxes:
             if box is None:
                 continue
             bx = np.asarray(box, dtype=np.float64).reshape(4)
@@ -487,7 +501,10 @@ def score_frame(
     direction); a missing cue gets ``None`` and its weight goes to the other.
     Output order: persons, then objects, in input order. ``depth`` (and
     optionally ``segmentation``) is used by ``occlusion: depth``; without a
-    depth map that mode is a no-op.
+    depth map that mode is a no-op. Pass the segmentation the objects were
+    built from: the target's and the person's own segment never occlude, nor
+    does the head box; the body box is ignored only when the own segment is
+    unknown (fallback), so real occluders in front of the person still count.
     """
     keep_p: list[Person] = []
     eyes_l, dirs_l, has_l = [], [], []
