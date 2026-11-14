@@ -1,10 +1,6 @@
-import torch
-try:
-    import accimage
-except ImportError:
-    accimage = None
+"""cv2/numpy image transforms used by the legacy Gaze360 code (torch imported lazily)."""
 import numpy as np
-import collections
+from collections.abc import Iterable
 import cv2
 
 _cv2_pad_to_str = {'constant': cv2.BORDER_CONSTANT,
@@ -20,6 +16,7 @@ _cv2_interpolation_to_str = {'nearest': cv2.INTER_NEAREST,
 _cv2_interpolation_from_str = {v: k for k, v in _cv2_interpolation_to_str.items()}
 
 def _is_tensor_image(img):
+    import torch  # lazy heavy import
     return torch.is_tensor(img) and img.ndimension() == 3
 
 def _is_numpy_image(img):
@@ -33,8 +30,11 @@ def to_tensor(pic):
     Returns:
         Tensor: Converted image.
     """
+    import torch  # lazy heavy import
     if not (_is_numpy_image(pic)):
         raise TypeError('pic should be ndarray. Got {}'.format(type(pic)))
+    if pic.ndim == 2:
+        pic = pic[:, :, None]
 
     # handle numpy array
     img = torch.from_numpy(pic.transpose((2, 0, 1)))
@@ -80,11 +80,10 @@ def resize(img, size, interpolation=cv2.INTER_LINEAR):
     """
     if not _is_numpy_image(img):
         raise TypeError('img should be numpy image. Got {}'.format(type(img)))
-    if not (isinstance(size, int) or (isinstance(size, collections.Iterable) and len(size) == 2)):
+    if not (isinstance(size, int) or (isinstance(size, Iterable) and len(size) == 2)):
         raise TypeError('Got inappropriate size arg: {}'.format(size))
-    w, h, = size
-
     if isinstance(size, int):
+        h, w = img.shape[:2]
         if (w <= h and w == size) or (h <= w and h == size):
             return img
         if w < h:
@@ -97,7 +96,7 @@ def resize(img, size, interpolation=cv2.INTER_LINEAR):
             output = cv2.resize(img, dsize=(ow, oh), interpolation=interpolation)
     else:
         output = cv2.resize(img, dsize=size[::-1], interpolation=interpolation)
-    if img.shape[2] == 1:
+    if img.ndim == 3 and img.shape[2] == 1:
         return output[:, :, np.newaxis]
     else:
         return output

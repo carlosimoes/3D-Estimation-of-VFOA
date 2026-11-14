@@ -1,93 +1,47 @@
-import sys
-from torch import load, no_grad, zeros
-from torch.nn import DataParallel
-from torch.cuda import empty_cache as cudaEmptyCache
-from time import time as timeSeconds
-from numpy import array,float16
-from math import cos, sin
-from torch.utils.data import Dataset, DataLoader
+"""Legacy Gaze360 predictor (thin alias of the vfoa accurate backend).
 
-from transforms import Resize, ToTensor, Normalize
+The implementation lives in :mod:`vfoa.backends.accurate.gaze360`: the GazeLSTM
+is loaded once on ``models.device``, crops are RGB (Refs #9) and every person
+gets a real 7-frame temporal window (Refs #7). The old batch ``__call__`` over
+a whole video is gone; the legacy VideoProcessor runs on the vfoa Pipeline.
+"""
 
-sys.path.append("/home/carlos/Thesis_GOD/detectron2/gaze360")
-from gaze360.code.model import GazeLSTM
+from __future__ import annotations
+
+import _bootstrap  # noqa: F401  (adds the repo root to sys.path)
+
+from typing import Any, Mapping, Optional
+
+from vfoa.backends.accurate.gaze360 import Gaze360Gaze
+from vfoa.config import load_config
+
+__all__ = ["GazePredictor"]
 
 
-IMAGE_NORMALIZE = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+class GazePredictor(Gaze360Gaze):
+    """Legacy API: ``GazePredictor(gazeModelFile, batchSize, uncertaintyThreshold)``.
 
-class GazePredictor:
-    def __init__(self, gazeModelFile, batchSize, uncertaintyThreshold):
-        """
-        :param gazeModelFile: path to mdel file.
-        :param uncertaintyThreshold: number to filter the outputs using model uncertainty score
-        """
-        self.gazeModel = gazeModelFile
+    A vfoa config mapping may be passed as ``cfg`` or as the first argument;
+    otherwise the ``accurate`` profile is used with the legacy arguments mapped
+    to ``gaze.weights``, ``gaze.batch_size`` and ``gaze.uncertainty_thr``.
+    """
+
+    def __init__(
+        self,
+        gazeModelFile: Any = None,
+        batchSize: Optional[int] = 16,
+        uncertaintyThreshold: float = 3.0,
+        cfg: Optional[Mapping[str, Any]] = None,
+        **kw: Any,
+    ) -> None:
+        if cfg is None and isinstance(gazeModelFile, Mapping):
+            cfg = gazeModelFile
+        if cfg is None:
+            gaze: dict = {"uncertainty_thr": float(uncertaintyThreshold)}
+            if batchSize is not None:
+                gaze["batch_size"] = int(batchSize)
+            if gazeModelFile is not None:
+                gaze["weights"] = str(gazeModelFile)
+            cfg = load_config(profile="accurate", overrides={"gaze": gaze})
+        super().__init__(cfg, **kw)
         self.batchSize = batchSize
-        self.threshold = uncertaintyThreshold
-
-    def __call__(self, inputs, mapFramesOutputs, fps):
-        """
-        :param inputs: video frames
-        :param mapFramesOutputs: map of frames and features, to build the model inputs by cropping the frames using head boxes.
-        :param fps: frames per second rate of the video
-        :return: list of float16 3D vector
-        """
-        self.model = DataParallel(GazeLSTM()).cuda()
-        self.model.load_state_dict(load(self.gazeModel)['state_dict'])
-        self.model.eval()
-        t = timeSeconds()
-        loader = DataLoader(GazeDataSet(inputs, mapFramesOutputs, fps), batch_size=self.batchSize, pin_memory=True)
-        gazesList = []
-        nBatches = len(loader)
-        step = max(1, len(loader) // 10)
-        with no_grad():
-            for i, data in enumerate(loader):
-                if i % step == 0:
-                    print("Gaze batch :", i + 1, "/", nBatches)
-                outputs = self.model(data.cuda())
-                gazes, uncertainties = outputs[0], outputs[1][:, 0]
-                for gaze, uncertainty in zip(gazes, uncertainties):
-                    if uncertainty.item() < self.threshold:
-                        cosi = cos(gaze[1])
-                        gazesList.append(
-                            array([cosi * sin(gaze[0]), sin(gaze[1]), -cosi * cos(gaze[0])], dtype=float16))
-                    else:
-                        gazesList.append(None)
-                del data, gazes, uncertainties, outputs
-                cudaEmptyCache()
-        t = timeSeconds() - t
-        print("Gaze estimation :", t, "seconds;", len(loader.dataset) / t, "detected individuals per second")
-        del loader.dataset, loader, self.model
-        cudaEmptyCache()
-        return gazesList
-
-class GazeDataSet(Dataset):
-    def __init__(self, frames, mapFramesOutputs, fps):
-        self.mapFramesOutputs = mapFramesOutputs
-        self.frames = frames
-        self.framesStep = max(int(fps // 8), 1)
-        self.inputs = []
-        for frame, instances in mapFramesOutputs.items():
-            for instance in instances.keys():
-                bbox = self.mapFramesOutputs.getHeadBox(frame, instance)
-                if bbox is not None:
-                    self.inputs.append((frame, instance))
-
-    def __len__(self):
-        return len(self.inputs)
-
-    def __getitem__(self, item):
-        """
-        Returns a (1,7,3, 224,224) tensor : values of the 2nd dimension are resized cropped images of the instance.
-        The fourth image of the sequence is the frame considered for input.
-        Can be optimized by storing the cropped and transformed frames for further use in the loading loop.
-        """
-        input_image = zeros(7, 3, 224, 224)
-        count = 0
-        frame, instance=self.inputs[item]
-        for image in range(frame - 3 * self.framesStep, frame+ 4 * self.framesStep, self.framesStep):
-            im = self.frames[frame]
-            bbox = self.mapFramesOutputs.getHeadBox(frame, instance)
-            input_image[count, :, :, :] = IMAGE_NORMALIZE(ToTensor()(Resize((224, 224))(im[bbox[1]:bbox[3], bbox[0]:bbox[2]])))
-            count += 1
-        return input_image.view(1, 7, 3, 224, 224)
