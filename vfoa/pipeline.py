@@ -23,6 +23,25 @@ every frame, reload models per call) is replaced by :class:`Pipeline`:
 * Every stage is timed with :class:`vfoa.timing.StageTimer` under the
   canonical stage names.
 
+Real-time mode (:mod:`vfoa.realtime`, Refs #35):
+
+* ``segmentation.async: true`` runs segmentation on an
+  :class:`~vfoa.realtime.AsyncStageRunner`. The frame loop never waits for
+  it: a scheduled frame is submitted only when the worker is idle (counters
+  ``segmentation_async_submits`` / ``segmentation_async_skips``), the previous
+  segmentation is used meanwhile, and on the frame where a new result is
+  swapped in ``ran["segmentation"]`` is True and the objects are rebuilt
+  (``segmentation_async_results``). A worker error propagates from
+  ``process()`` as in synchronous mode.
+* ``input.realtime: true`` makes :func:`open_input` wrap the source in a
+  :class:`~vfoa.realtime.LatestFrameSource`; :meth:`Pipeline.run` then adds
+  the counters ``dropped_frames`` and ``captured_frames``.
+* Capture-to-result latency (capture time of the frame, or its read time for
+  plain sources, to the end of its finalisation) is kept in a separate timer
+  and reported as ``summary["latency"]`` (frames, mean/p50/p95/max ms); it is
+  not part of ``FrameResult.timings_ms``. ``summary["async"]`` holds the
+  runner statistics. Offline runs (both options false) are unchanged.
+
 All 3D quantities are in the camera frame of the left camera (metres, +Z
 forward); times are seconds (``frame.index / fps``).
 """
@@ -86,7 +105,7 @@ def open_input(cfg: Mapping[str, Any]) -> Any:
                 stacklevel=2,
             )
             return src
-        return LatestFrameSource(src, pace=True)
+        return LatestFrameSource(src, pace=bool(inp.get("pace", True)))
     return src
 
 
@@ -124,6 +143,7 @@ class _Pending:
     persons: list[Person]
     persons_ran: bool
     timings: dict[str, float]  # seconds measured during ingest (replayed at finalize)
+    capture: Optional[float] = None  # time.perf_counter() when the frame was captured
 
 
 def _section(cfg: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -164,6 +184,7 @@ class Pipeline:
         self._owned: set[str] = set()
         self._opened = False
         self.fps = 30.0
+        self.last_summary: dict = {}
 
     # ------------------------------------------------------------------ open
     def open(self, fps: Optional[float], fingerprint: Optional[str] = None) -> "Pipeline":
@@ -177,6 +198,7 @@ class Pipeline:
         self.caches = {}
         self._owned = set()
         self._runner = None
+        self.last_summary = {}
         try:
             self._open(fps, fingerprint)
         except BaseException:
@@ -189,6 +211,7 @@ class Pipeline:
         cfg = self.cfg
         self.fps = float(fps) if fps is not None and fps > 0 else 30.0
         self.timer.reset()
+        self._latency = StageTimer(enabled=self.timer.enabled)
         self._t_open = time.perf_counter()
 
         # 1. backends
@@ -259,6 +282,9 @@ class Pipeline:
         self._frames = 0
         self._seg_async = bool(_section(cfg, "segmentation").get("async")) and "segmentation" not in self.caches
         self._runner = self._make_runner("segmentation", self._segment_fn())
+        if self._seg_async:
+            for name in ("submits", "skips", "results"):
+                self.timer.count(f"segmentation_async_{name}", 0)
 
     def _ensure_loaded(self, kind: str) -> Optional[Backend]:
         """Load (once) and reset backend ``kind``; load time goes to ``setup_ms``."""
@@ -344,7 +370,8 @@ class Pipeline:
         return payload
 
     # ------------------------------------------------------------------ process
-    def process(self, frame: Frame, extra_timings: Optional[Mapping[str, float]] = None) -> list[FrameResult]:
+    def process(self, frame: Frame, extra_timings: Optional[Mapping[str, float]] = None, *,
+                capture_time: Optional[float] = None) -> list[FrameResult]:
         """Ingest ``frame`` and return the frames finalised by it (in frame order).
 
         ``extra_timings`` (seconds, e.g. ``{"read": dt}``) are attributed to
@@ -352,7 +379,7 @@ class Pipeline:
         """
         if not self._opened:
             raise RuntimeError("Pipeline.process() called before open()")
-        self._ingest(frame, extra_timings)
+        self._ingest(frame, extra_timings, capture_time)
         out: list[FrameResult] = []
         while len(self._pending) > self.lookahead:
             out.append(self._finalize(self._pending.popleft()))
@@ -365,7 +392,8 @@ class Pipeline:
             out.append(self._finalize(self._pending.popleft()))
         return out
 
-    def _ingest(self, frame: Frame, extra_timings: Optional[Mapping[str, float]]) -> None:
+    def _ingest(self, frame: Frame, extra_timings: Optional[Mapping[str, float]],
+                capture_time: Optional[float] = None) -> None:
         timed = self.timer.enabled
         timings: dict[str, float] = {}
 
@@ -393,7 +421,7 @@ class Pipeline:
             t0 = time.perf_counter()
             gb.observe(frame, persons)
             record("gaze:observe", time.perf_counter() - t0)
-        self._pending.append(_Pending(frame, persons, ran, timings))
+        self._pending.append(_Pending(frame, persons, ran, timings, capture_time))
 
     def _finalize(self, entry: _Pending) -> FrameResult:
         cfg = self.cfg
@@ -448,10 +476,14 @@ class Pipeline:
                     if self._seg_async:
                         # only accepted submissions count as segmentation runs
                         timer.add("segmentation", time.perf_counter() - t0)
+                if self._seg_async:
+                    timer.count("segmentation_async_submits" if accepted else "segmentation_async_skips")
             got = self._runner.poll()
             if got is not None:
                 self._seg = got[1]
                 ran["segmentation"] = True
+                if self._seg_async:
+                    timer.count("segmentation_async_results")
         seg = self._seg
 
         # scene objects (rebuilt only when segmentation or depth changed)
@@ -497,6 +529,9 @@ class Pipeline:
         self._frames += 1
         ran.update(scene=True, smoothing=True, attention=True)
         timings = timer.frame_done()
+        if entry.capture is not None and self._latency.enabled:
+            self._latency.add("latency", max(time.perf_counter() - entry.capture, 0.0))
+            self._latency.frame_done()
         log_every = int(_section(cfg, "runtime").get("log_every", 0) or 0)
         if log_every > 0 and self._frames % log_every == 0:
             logger.info("frame %d (%d processed)", i, self._frames)
@@ -550,6 +585,7 @@ class Pipeline:
         }
         # frames still waiting in the lookahead buffer were never finalised
         complete = complete and not getattr(self, "_pending", None)
+        runner = getattr(self, "_runner", None)
         self._close_resources(complete)
         for stage, c in self.caches.items():
             caches[stage]["complete"] = bool(c.complete)
@@ -561,6 +597,14 @@ class Pipeline:
         }
         summary["cache"] = caches
         summary["wall_s"] = time.perf_counter() - self._t_open
+        lat = (self._latency.summary().get("stages") or {}).get("latency")
+        summary["latency"] = {} if lat is None else {
+            "frames": lat["runs"], "mean_ms": lat["mean_ms"], "p50_ms": lat["p50_ms"],
+            "p95_ms": lat["p95_ms"], "max_ms": lat["max_ms"],
+        }
+        stats = getattr(runner, "stats", None)
+        summary["async"] = {"segmentation": dict(stats())} if self._seg_async and callable(stats) else {}
+        self.last_summary = summary
         return summary
 
     # ------------------------------------------------------------------ run
@@ -593,9 +637,11 @@ class Pipeline:
                     frame = next(it)
                 except StopIteration:
                     break
-                dt = time.perf_counter() - t0
+                now = time.perf_counter()
+                captured = getattr(source, "last_capture_time", None)
                 frames[int(frame.index)] = frame
-                emit(self.process(frame, extra_timings={"read": dt}), frames)
+                emit(self.process(frame, extra_timings={"read": now - t0},
+                                  capture_time=captured if isinstance(captured, (int, float)) else now), frames)
             while self._pending:
                 emit([self._finalize(self._pending.popleft())], frames)
             complete = not bool(_section(self.cfg, "input").get("realtime"))
@@ -603,8 +649,11 @@ class Pipeline:
             dropped = getattr(source, "dropped_frames", None)
             if dropped is None:
                 dropped = getattr(source, "dropped", None)
-            if isinstance(dropped, int) and dropped > 0:
+            if isinstance(dropped, int) and dropped >= 0:
                 timer.count("dropped_frames", dropped)
+            captured_n = getattr(source, "frames_read", None)
+            if isinstance(captured_n, int):
+                timer.count("captured_frames", captured_n)
             try:
                 summary = self.close(complete=complete)
             finally:

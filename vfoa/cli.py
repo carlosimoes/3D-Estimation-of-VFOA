@@ -8,9 +8,16 @@ and writes into ``output.dir``:
 * ``results.jsonl`` one JSON object per frame (``output.jsonl``),
 * ``results.csv``   one row per (frame, person, object) (``output.csv``),
 * ``overlay.mp4``   overlay video (``output.video`` / ``--video``),
-* ``timing.json``   the run summary (per-stage timing, cache statistics),
+* ``timing.json``   the run summary (per-stage timing, cache statistics; in
+  real-time mode also ``counters.dropped_frames``/``counters.captured_frames``,
+  ``latency`` capture->result statistics in ms, ``async`` worker statistics of
+  asynchronous stages and ``interrupted: true`` after Ctrl-C),
 
-and prints the per-stage timing table. Re-scoring without models: run the same
+and prints the per-stage timing table. ``--realtime`` wraps the source in a
+latest-frame reader that drops frames the pipeline cannot keep up with;
+``--set segmentation.async=true`` runs segmentation on a worker thread. Ctrl-C
+stops an endless stream cleanly: the summary is still written and the exit
+code is 130. Re-scoring without models: run the same
 command with ``--set cache.enabled=true`` once, then again with
 ``--set cache.enabled=true --set cache.mode=read`` plus new attention or
 smoothing settings.
@@ -25,7 +32,7 @@ import sys
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-__all__ = ["build_parser", "config_from_args", "build_sinks", "main"]
+__all__ = ["build_parser", "config_from_args", "build_sinks", "live_lines", "main"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -105,6 +112,23 @@ def build_sinks(cfg: Any, source: Any) -> list:
     return sinks
 
 
+def live_lines(summary: Any) -> list[str]:
+    """Human-readable latency / asynchronous-stage lines of a run summary."""
+    lines: list[str] = []
+    lat = summary.get("latency") or {}
+    if lat:
+        lines.append(
+            f"latency capture->result: mean {lat['mean_ms']:.1f} ms  p50 {lat['p50_ms']:.1f}  "
+            f"p95 {lat['p95_ms']:.1f}  max {lat['max_ms']:.1f}  ({lat['frames']} frames)"
+        )
+    for stage, st in (summary.get("async") or {}).items():
+        lines.append(
+            f"async {stage}: submitted {st['submitted']}  skipped {st['skipped']}  completed {st['completed']}  "
+            f"failed {st['failed']}  worker mean {st['mean_ms']:.1f} ms  max {st['max_ms']:.1f} ms"
+        )
+    return lines
+
+
 def _run(args: argparse.Namespace) -> int:
     from vfoa.config import dump_config  # noqa: PLC0415
     from vfoa.pipeline import Pipeline, open_input  # noqa: PLC0415
@@ -120,12 +144,20 @@ def _run(args: argparse.Namespace) -> int:
         source.close()
         raise
     pipeline = Pipeline(cfg)
-    summary = pipeline.run(source, sinks)
+    interrupted = False
+    try:
+        summary = pipeline.run(source, sinks)
+    except KeyboardInterrupt:
+        interrupted = True
+        summary = dict(pipeline.last_summary)
+        summary["interrupted"] = True
     with open(out_dir / "timing.json", "w", encoding="utf-8", newline="\n") as fh:
         json.dump(summary, fh, indent=1, sort_keys=True, default=str)
     print(pipeline.timer.report())
-    print(f"results written to {out_dir}")
-    return 0
+    for line in live_lines(summary):
+        print(line)
+    print(f"results written to {out_dir}" + (" (interrupted)" if interrupted else ""))
+    return 130 if interrupted else 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
