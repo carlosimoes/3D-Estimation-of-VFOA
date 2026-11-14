@@ -4,12 +4,15 @@
 at runtime) that are resolved lazily with importlib: importing this package
 imports no backend module. ``create_backend(kind, cfg)`` reads
 ``cfg[kind].backend`` and returns an (unloaded) instance, or ``None`` for
-``"none"``.
+``"none"``. ``create_backend_with_fallback(kind, cfg)`` additionally honours
+``cfg[kind].fallback``: the primary backend is loaded eagerly and, when it is
+unavailable, the fallback backend is created and loaded instead.
 """
 
 from __future__ import annotations
 
 import importlib
+import logging
 from typing import Any, Mapping, Optional, Union
 
 from .base import KINDS, Backend, BackendUnavailable
@@ -20,10 +23,13 @@ __all__ = [
     "resolve",
     "available",
     "create_backend",
+    "create_backend_with_fallback",
     "Backend",
     "BackendUnavailable",
     "KINDS",
 ]
+
+log = logging.getLogger(__name__)
 
 REGISTRY: dict[str, dict[str, Union[str, type]]] = {
     "depth": {
@@ -45,6 +51,7 @@ REGISTRY: dict[str, dict[str, Union[str, type]]] = {
     "gaze": {
         "gaze360": "vfoa.backends.accurate.gaze360:Gaze360Gaze",
         "head_proxy": "vfoa.backends.fast.head_proxy_gaze:HeadProxyGaze",
+        "l2cs": "vfoa.backends.fast.l2cs_gaze:BinnedGaze360Backend",
         "synthetic": "vfoa.backends.synthetic:SyntheticGaze",
     },
     "segmentation": {
@@ -111,3 +118,36 @@ def create_backend(kind: str, cfg: Mapping[str, Any]) -> Optional[Backend]:
         return None
     cls = resolve(kind, name)
     return cls(cfg)
+
+
+def create_backend_with_fallback(kind: str, cfg: Mapping[str, Any]) -> tuple[Optional[Backend], Optional[str]]:
+    """Create the backend of ``kind``, falling back to ``cfg[kind].fallback`` when it is unavailable.
+
+    Without a fallback (or when it equals the primary name) this is
+    :func:`create_backend` and the backend is NOT loaded; returns
+    ``(backend, None)``. With a fallback the primary backend is loaded
+    eagerly; on :class:`BackendUnavailable` a warning with the reason is
+    logged and the fallback backend is created and loaded instead, returning
+    ``(fallback_backend, fallback_name)``. Errors of the fallback propagate.
+    """
+    _check_kind(kind)
+    section = cfg.get(kind) or {}
+    name = section.get("backend")
+    fallback = section.get("fallback")
+    backend = create_backend(kind, cfg)
+    if backend is None or not fallback or fallback == name:
+        return backend, None
+    try:
+        backend.load()
+        return backend, None
+    except BackendUnavailable as exc:
+        log.warning("%s backend %r unavailable (%s); falling back to %r", kind, name, exc, fallback)
+        try:
+            backend.close()
+        except Exception:  # pragma: no cover - best effort
+            pass
+    if fallback == "none":
+        return None, "none"
+    fb = resolve(kind, str(fallback))(cfg)
+    fb.load()
+    return fb, str(fallback)

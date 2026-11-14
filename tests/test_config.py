@@ -31,7 +31,9 @@ def test_default_sections_and_spot_values():
     assert cfg.depth.backend == "constant"
     assert cfg.persons.backend == "yolo_pose"
     assert cfg.headpose.backend == "keypoints"
-    assert cfg.gaze.backend == "none"
+    assert cfg.gaze.backend == "l2cs"
+    assert cfg.gaze.fallback == "head_proxy"
+    assert DEFAULTS["gaze"]["backend"] == "none" and DEFAULTS["gaze"]["fallback"] is None
     assert cfg.segmentation.backend == "yolo_seg"
     assert cfg.segmentation.stride == 10
     assert cfg.segmentation["async"] is False
@@ -51,7 +53,7 @@ def test_profiles(profile):
     if profile == "fast":
         assert backends == {
             "depth": "constant", "persons": "yolo_pose", "headpose": "keypoints",
-            "gaze": "none", "segmentation": "yolo_seg",
+            "gaze": "l2cs", "segmentation": "yolo_seg",
         }
     elif profile in ("accurate", "thesis"):
         assert backends == {
