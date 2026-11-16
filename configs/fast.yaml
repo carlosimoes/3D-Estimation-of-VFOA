@@ -57,11 +57,13 @@ gaze:
 #   device: auto              # auto|cpu|cuda|cuda:0
 #   weights_dir: weights
 # runtime:
-#   num_threads: null         # null: YOLO caps torch at cpu_count//2 on CPU; int: torch + ONNX Runtime threads
+#   num_threads: null         # null: YOLO caps torch at cpu_count//2 on CPU (cpu_count//4 with segmentation.async);
+#                             # int: torch + ONNX Runtime threads; 2 is a good value on a shared CPU
 #
 # CPU preset (a CPU-only machine; see docs/performance.md). Measured on an 8-vCPU VM with
-# museum.mp4: 18-21 FPS vs 18.5 FPS at the default strides; it lowers the average model load,
-# and with async segmentation export OMP_WAIT_POLICY=PASSIVE to avoid persons spikes:
+# museum.mp4 (2026-11-16, 2 torch threads by the async default): 17-24 FPS vs 13-19 FPS at the
+# default strides on a quiet machine; it lowers the average model load. With the async thread
+# cap there are no persons spikes, so OMP_WAIT_POLICY=PASSIVE is no longer needed:
 # persons:
 #   stride: 2
 # gaze:

@@ -140,8 +140,16 @@ VFOA_RUN_NETWORK=1 python -m pytest -q -m network   # downloads YOLO / L2CS weig
 - **Head pose** (yaw, pitch, roll in degrees) -> forward =
   (-sin yaw, -cos yaw sin pitch, -cos yaw cos pitch) (#2); +yaw turns towards image
   left, +pitch looks up.
-- **Gaze360** (yaw, pitch in radians) is converted by `vfoa.geometry.gaze360_to_camera`,
-  with an optional eye-ray correction (`gaze.eye_frame_correction`).
+- **Gaze360 / L2CS** (yaw t, pitch p in radians) use the Gaze360 dataset eye frame:
+  right-handed, +x points to the image left, +y up, +z away from the camera, with
+  g = (cos p sin t, sin p, -cos p cos t). `vfoa.geometry.gaze360_to_camera` converts it
+  to the camera frame as (-g.x, -g.y, g.z) (a rotation, not a mirror): t = p = 0 looks
+  into the camera, +t turns towards the image left, +p looks up.
+- **Eye-ray correction** (`vfoa.geometry.ray_aligned`): crop-based models predict a
+  direction relative to the camera -> eye ray, so the direction is rotated into that
+  ray's frame. It applies to gaze360 (`gaze.eye_frame_correction`), l2cs
+  (`gaze.l2cs.perspective_correction`, default true) and FSA-Net
+  (`headpose.eye_frame_correction`); all three default to true.
 - **Time**: `Frame.index` is the absolute 0-based source index; `t = index / fps` seconds.
 
 ## Configuration
@@ -159,8 +167,8 @@ the fast profile on the repository's Sintel clip. Every key read by the code is 
 | `depth` | `backend`, `stride`, `phase`, `scale` (stereo matching resolution), `num_disparities`, `block_size`, `wls`, `wls_lambda`, `wls_sigma`, `min_depth_m`, `max_depth_m`, `constant_depth_m`, `speckle_window`, `speckle_range` |
 | `persons` | `backend`, `stride`, `phase`, `score_thr`, `kpt_thr`, `model`, `imgsz`, `head_scale`, `match_keypoints`; OpenPose/DensePose paths, `densepose_thr`, `upper_body_only`, `match_min_inside`, `keep_headless` |
 | `tracking` | `type` (byte/greedy_iou), `box` (head/body), `iou_thr`, `max_age`, `high_thr`, `low_thr`, `motion`, `max_predict_frames` |
-| `headpose` | `backend`, `stride`, `phase`, `max_hold_frames`, FSA-Net `models`; keypoints backend: `relaxed_kpt_thr`, `fallback_confidence`, `max_reproj_frac` |
-| `gaze` | `backend`, `fallback`, `stride` (fast: 2), `phase`, `max_hold_frames`; Gaze360: `window`, `window_step`, `uncertainty_thr`, `eye_frame_correction`, `weights`, `batch_size`; `proxy_confidence` (head_proxy); `l2cs.{model, path, url, sha256, download, input_size, kpt_thr, crop_margin, perspective_correction, providers}` |
+| `headpose` | `backend`, `stride`, `phase`, `max_hold_frames`, FSA-Net `models`, `eye_frame_correction`; keypoints backend: `relaxed_kpt_thr`, `fallback_confidence`, `max_reproj_frac` |
+| `gaze` | `backend`, `fallback`, `stride` (fast: 2), `phase`, `max_hold_frames`; Gaze360: `window`, `window_step`, `uncertainty_thr`, `eye_frame_correction`, `weights`, `batch_size`; `proxy_confidence` (head_proxy); `l2cs.{model, path, url, sha256, download, input_size, kpt_thr, crop_margin, perspective_correction, confidence_ref, providers}` |
 | `segmentation` | `backend`, `stride`, `phase`, `async`, `score_thr`, `model`, `imgsz`, Panoptic FPN paths, `panoptic_thr` |
 | `scene` | `point_stride`, `max_points_per_object`, `min_points`, `outlier` (percentile/radius/none), `outlier_percentiles`, `outlier_nb_points`, `outlier_radius_m`, `outlier_radius_scale`, `ignore_labels`, `person_labels`, `self_min_overlap`, `self_aabb_margin_m`, `eye_patch_px`, `match_dist_m`, `object_max_age` |
 | `attention` | `method` (angular/rays), `sigma_gaze_deg`, `sigma_head_deg`, `fusion` (fixed/agreement/confidence), `w_gaze`, `w_head`, `agreement_deg`, `target` (surface/centroid), `occlusion` (depth/aabb/none), `occlusion_margin_m`, `occlusion_samples`, `min_target_distance_m`, `distance_full_m`, `distance_decay_m`, `min_score`, `rays.{n, half_angles_gaze_deg, half_angles_head_deg}` |
@@ -168,7 +176,7 @@ the fast profile on the repository's Sintel clip. Every key read by the code is 
 | `cache` | `enabled`, `dir`, `mode` (readwrite/read/write), `stages`, `chunk_size` |
 | `output` | `dir`, `jsonl`, `csv`, `video`, `show` |
 | `models` | `device` (auto/cpu/cuda), `weights_dir`, `allow_download`, `third_party_root` |
-| `runtime` | `lookahead_frames`, `num_threads` (null: library defaults, except that the YOLO backends cap torch at half the logical CPUs on CPU; an integer sets the torch threads of the YOLO models and `intra_op_num_threads` of the ONNX Runtime sessions, l2cs and FSA-Net), `seed`, `log_every` |
+| `runtime` | `lookahead_frames`, `num_threads` (null: library defaults, except that on CPU the YOLO backends cap torch at half the logical CPUs, a quarter with `segmentation.async`; an integer sets the torch threads of the YOLO models and `intra_op_num_threads` of the ONNX Runtime sessions, l2cs and FSA-Net), `seed`, `log_every` |
 | `timing` | `enabled` |
 | `synthetic` | `width`, `height`, `fps`, `n_frames`, `n_persons`, `n_objects`, `seed`, `noise_deg`, `occluder`, `cost_ms`, `sway_m` |
 
@@ -195,17 +203,31 @@ MobileOne-S0 at 448 px, on a square face crop gated on the nose plus one eye.
 - **Licence.** The MobileGaze code is MIT, but the weights are trained on Gaze360,
   whose terms allow **research / non-commercial use only**. The weights are never
   committed (`weights/` is git-ignored); do not redistribute them.
-- **Known limitations.** The yaw/pitch-to-camera sign convention was derived from the
-  code: it broadly agrees with the keypoint head direction on the real clips, but
-  differs by 25-60 degrees on the Sintel CG clip, so it is plausible but **not
-  confirmed**. The entropy-based confidence is low (about 0.2-0.26), so
-  `attention.fusion: confidence` under-weights gaze. The released ONNX files have a
-  static batch of 1 (one call per person; on the 8-vCPU test machine a gaze run cost
-  about 8-15 ms per frame on museum.mp4 with the torch-thread fix), hence
-  `gaze.stride: 2` in the fast profile. The session disables ONNX Runtime's intra-op
-  spin-waiting so its threads do not compete with torch (see
-  [docs/performance.md](docs/performance.md#cpu-threading)). Persons seen from behind get no L2CS
-  gaze.
+- **Sign convention (verified).** The model outputs Gaze360-convention yaw/pitch (see
+  Conventions), converted by `vfoa.geometry.gaze360_to_camera`. Sources: the output
+  order and `draw_gaze` of the upstream MobileGaze `onnx_inference.py`; the Gaze360
+  dataset README (eye frame with +x to the image left, +y up, +z away from the camera);
+  and, on the repository clips got.mp4, museum.mp4 and video.mp4, agreement with the
+  nose-offset head-turn cue (correlation +0.63, 89% sign agreement; verification,
+  2026-11-16).
+- **Sintel.** On the Sintel CG clip L2CS and the keypoint head direction still differ
+  by 25-60 degrees. This is not a sign error: the character's head is turned left
+  while the eyes look down-right, and on a CG face the model output is unstable from
+  frame to frame.
+- **Eye-ray correction.** `gaze.l2cs.perspective_correction` (default true) rotates the
+  gaze into the frame of the camera -> eye ray (the eye pixels, else the crop centre).
+- **Confidence.** The raw entropy certainty of the 4-degree bins sits in a narrow band
+  (about 0.18-0.37, median 0.24 on the repository clips), so it is rescaled:
+  confidence = clip(raw / `gaze.l2cs.confidence_ref`, 0, 1) x face visibility, with
+  `confidence_ref` 0.25 by default; null or <= 0 keeps the raw value (which makes
+  `attention.fusion: confidence` under-weight gaze).
+- **Cost.** The released ONNX files have a static batch of 1 (one call per person). On
+  the 8-vCPU test machine, when it was quiet, L2CS cost about 8-15 ms per gaze run on
+  museum.mp4 (benchmark-docs, 2026-11-16), hence `gaze.stride: 2` in the fast
+  profile. The session disables ONNX Runtime's intra-op spin-waiting so its threads
+  do not compete with torch (see
+  [docs/performance.md](docs/performance.md#cpu-threading)).
+- Persons seen from behind get no L2CS gaze (no face gate); they fall back to head pose.
 
 ## Cache and re-scoring without models
 
@@ -231,6 +253,13 @@ python -m vfoa run --profile fast --input 0 --realtime --set segmentation.async=
 - `--realtime` (`input.realtime`) wraps the source in a latest-frame reader: frames
   the pipeline cannot keep up with are dropped instead of queued. A file source is
   replayed at its native fps (`input.pace`).
+- Live camera input (`--input 0`) is monocular, so depth is `constant` (see Known
+  limitations). Stereo depth needs files (`--input LEFT --right RIGHT`) or a custom
+  `FrameSource` that fills `Frame.right` with the rectified right image.
+- Strides are counted in source frames, not in processed frames: when frames are
+  dropped, `segmentation.stride: 10` means every 10 / fps seconds, so on a slow CPU
+  segmentation (and gaze, stride 2) can be due on almost every processed frame. Raise
+  the strides when the processing rate is far below the source rate.
 - `--set segmentation.async=true` runs segmentation on a worker thread; the frame loop
   never waits for it and uses the previous segmentation meanwhile.
 - `--set runtime.lookahead_frames=0` (the default) gives one result per input frame
@@ -240,16 +269,25 @@ python -m vfoa run --profile fast --input 0 --realtime --set segmentation.async=
   `counters` (`dropped_frames`, `captured_frames`, `gaze_fallback`,
   `segmentation_async_*`), `latency` (capture-to-result ms), `async` (worker
   statistics), `cache`, `backends` and `wall_s`.
+- Speed on the 8-vCPU CPU-only test machine (museum.mp4, 1280x720, fast profile,
+  default strides, not real-time mode): 18.5 FPS on a quiet machine (13-19 FPS over
+  repeated runs), but 3-8 FPS when other CPU-bound jobs share the machine. See
+  [docs/performance.md](docs/performance.md#run-to-run-variance).
+- Real-time mode on the same machine (`input.realtime=true`, `segmentation.async=true`,
+  museum.mp4 replayed at 23.98 fps): 6.0-8.3 FPS processed with the current thread
+  default, against 0.8-1.3 FPS with the old 4-thread default (one run at a time,
+  2026-11-16; see [docs/performance.md](docs/performance.md#real-time-mode)).
 - CPU preset (see `configs/fast.yaml`): `--set persons.stride=2 --set gaze.stride=4
-  --set segmentation.stride=30 --set segmentation.async=true`. On the 8-vCPU test
-  machine the fast profile ran at 18.5 FPS on museum.mp4 with the default strides and
-  at 18-21 FPS with the CPU preset; the preset mainly lowers the average model load,
-  while async segmentation can still cause persons spikes (p95 283 ms) unless
-  `OMP_WAIT_POLICY=PASSIVE` is exported before start.
-- CPU threads: on CPU the YOLO backends cap torch at half the logical CPUs (ultralytics
-  would otherwise use `cpu_count - 1`, which spin-waits and was 25x slower on a shared
-  VM); `runtime.num_threads` overrides this. See
-  [docs/performance.md](docs/performance.md#cpu-threading).
+  --set segmentation.stride=30 --set segmentation.async=true`: 17-24 FPS on museum.mp4
+  with the current thread default, without the persons spikes seen before the async
+  thread cap, so `OMP_WAIT_POLICY=PASSIVE` is no longer needed.
+- CPU threads: on CPU the YOLO backends cap torch at half the logical CPUs, or a
+  quarter when `segmentation.async` is true, because the frame loop and the
+  segmentation worker then run two torch thread pools (ultralytics would otherwise use
+  `cpu_count - 1`, which spin-waits and was 25x slower on a shared VM).
+  `runtime.num_threads` overrides this; **when the machine is shared, use
+  `--set runtime.num_threads=2`** (under load it beat the 4-thread default: 7.9 against
+  5.1-5.8 FPS). See [docs/performance.md](docs/performance.md#cpu-threading).
 
 ## Benchmark
 
@@ -277,6 +315,38 @@ measured without stereo footage; `--micro` adds the micro-benchmarks of the #32 
 unavailable the benchmark prints `SKIPPED: <reason>`, writes `status: skipped` and
 exits 0. Measured CPU numbers are in [docs/performance.md](docs/performance.md);
 GPU numbers are to be measured with the same commands.
+
+## Known limitations
+
+Numbers marked "(verification, 2026-11-16)" come from the verification run of the
+`realtime-integration` branch on the 8-vCPU CPU-only test machine.
+
+- **Constant depth gives little 3D attention.** With `depth.backend=constant` (the
+  default of the fast profile on monocular video) the eyes and every object lie in one
+  fronto-parallel plane, so a target is found for only 9-28% of the person-frames on
+  the repository clips (verification, 2026-11-16). Meaningful 3D attention needs real
+  depth: `stereo_bm` (a stereo pair) or `sintel_gt` (Sintel ground truth). A monocular
+  depth backend does not exist yet.
+- **The thesis ray method misses small objects.** `attention.method=rays` (the thesis
+  profile) casts rays on rings at 11.3 and 21.8 degrees around the gaze (12.5 and 24.0
+  around the head direction), with no centre ray, as in the thesis. An object that subtends less than the inner ring and is
+  looked at directly gets no hits: 0 of 240 targets on the synthetic scene
+  (verification, 2026-11-16). Use angular scoring (`attention.method: angular`, the
+  default of the other profiles).
+- **The accurate backends were never run with the real thesis models** (detectron2,
+  DensePose, OpenPose, Gaze360, FSA-Net are not on the development machine); they are
+  tested with fakes only.
+- **YOLO11n-seg only knows the COCO classes**, so objects outside the 80 COCO classes
+  are not segmented and cannot be attention targets in the fast profile.
+- **Head pose yaw.** The keypoint head pose seems to overestimate yaw compared with
+  l2cs gaze (regression slope of l2cs yaw on head yaw 0.34-0.57 on the repository
+  clips; verification, 2026-11-16). This is not validated against ground truth.
+- **Fallback naming.** After a gaze fallback (for example l2cs -> head_proxy) the
+  written `config.yaml` still names the requested backend; the `backends` entry of
+  `timing.json` names the backend that actually ran (and `gaze_fallback` counts the
+  switch).
+- **Timing of the `output` stage.** The `output` stage shows N-1 runs for N frames,
+  because the last frame's output time is added after its record is closed.
 
 ## Fixed issues
 
@@ -306,6 +376,8 @@ available on the development machine).
 | #30 | Unit tests (`tests/`, models faked) and a CI workflow (`.github/workflows/tests.yml`) |
 | #32 | No PLY round-trip, a single (optionally scaled) StereoBM, models loaded once, streamed video (see `--micro`) |
 | #35 | Fast backends, multi-rate stages, real-time mode, asynchronous segmentation, benchmark |
+| #2, #7 (follow-up) | Gaze360 axes: the eye frame has +x to the image left, so the camera vector is (-g.x, -g.y, g.z) (a rotation; it was mirrored left-right); gaze360, l2cs and FSA-Net share one eye-ray correction (`geometry.ray_aligned`) |
+| #35, #32 (follow-up) | CPU torch thread cap: a quarter of the logical CPUs with `segmentation.async` (two torch pools), half otherwise; real-time mode on museum.mp4 went from under 1 FPS to several FPS (see [docs/performance.md](docs/performance.md#real-time-mode)) |
 | optional | #10 detectors see the original image, #11 replaced by the scene builder, #13 single device, no process pools, #18 ByteTrack-style tracking, #21 confidence-weighted fusion, #31 structured JSONL/CSV outputs with frame timestamps |
 
 Note: adding the reconciled config keys to `DEFAULTS` changes the stage-cache keys

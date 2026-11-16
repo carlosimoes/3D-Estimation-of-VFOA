@@ -449,3 +449,49 @@ def test_readme_and_performance_doc():
     perf = (REPO / "docs" / "performance.md").read_text(encoding="utf-8")
     for topic in ("bench_pipeline.py", "--profile synthetic", "--profile fast", "| total |", "GPU", "--micro"):
         assert topic in perf, topic
+
+
+def _md_section(text: str, heading: str) -> str:
+    """The Markdown section that starts at ``heading`` and ends at the next level-2 heading."""
+    start = text.index(heading)
+    end = text.find("\n## ", start + len(heading))
+    return text[start:] if end < 0 else text[start:end]
+
+
+def test_docs_cover_realtime_variance_and_gaze():
+    perf = (REPO / "docs" / "performance.md").read_text(encoding="utf-8")
+    assert "differ by 10-20%" not in perf
+    assert "Run-to-run variance" in perf
+    rt = _md_section(perf, "\n## Real-time mode")
+    for topic in ("input.realtime=true", "segmentation.async=true", "Strides are counted in source frames"):
+        assert topic in rt, topic
+    lines = rt.splitlines()
+    header = [i for i, line in enumerate(lines) if line.startswith("|") and "torch threads" in line]
+    assert header, "real-time table header"
+    rows = []
+    for line in lines[header[0] + 2:]:
+        if not line.startswith("|"):
+            break
+        rows.append(line)
+    assert len(rows) >= 3, rows
+
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    limits = _md_section(readme, "\n## Known limitations")
+    for topic in ("depth.backend=constant", "attention.method=rays", "thesis models", "COCO", "overestimate",
+                  "config.yaml", "`output` stage"):
+        assert topic in limits, topic
+    for topic in ("confidence_ref", "headpose.eye_frame_correction", "perspective_correction",
+                  "+x points to the image left", "per gaze run", "runtime.num_threads=2", "Frame.right"):
+        assert topic in readme, topic
+    assert "not confirmed" not in readme
+    bullets = re.split(r"\n(?=- )", readme)
+    fps_bullets = [b for b in bullets if "18.5 FPS" in b]
+    assert fps_bullets
+    for bullet in fps_bullets:
+        assert "quiet" in bullet and "3-8 FPS" in bullet, bullet
+
+    src = (REPO / "vfoa" / "config.py").read_text(encoding="utf-8").splitlines()
+    idx = next(i for i, line in enumerate(src) if '"num_threads": None' in line)
+    comment = "\n".join(src[max(0, idx - 6):idx])
+    for topic in ("half", "quarter", "segmentation.async"):
+        assert topic in comment, topic
