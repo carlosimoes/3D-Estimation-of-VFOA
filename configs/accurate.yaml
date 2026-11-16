@@ -39,5 +39,7 @@ segmentation:
 # segmentation:
 #   stride: 1
 #   async: false
+# tracking:
+#   box: body                 # head|body box for IoU matching, the other kind is the fallback (thesis profile: head)
 # runtime:
 #   lookahead_frames: 0       # >= 3 * gaze window_step for a centred Gaze360 window

@@ -393,6 +393,7 @@ def test_module_defaults_are_consistent():
         for key, value in module._DEFAULTS.items():
             assert key in DEFAULTS[section], f"{section}.{key}"
             assert DEFAULTS[section][key] == value, f"{section}.{key}"
+    assert tracking._DEFAULTS["box"] == "body" == DEFAULTS["tracking"]["box"]
 
 
 def test_reconciled_keys_and_fast_strides():
@@ -409,6 +410,8 @@ def test_reconciled_keys_and_fast_strides():
                          ("scene", "self_aabb_margin_m"), ("smoothing", "jump_deg"), ("synthetic", "sway_m"),
                          ("gaze", "fallback"), ("gaze", "l2cs")]:
         assert key in DEFAULTS[section], f"{section}.{key}"
+    assert DEFAULTS["gaze"]["l2cs"]["full_conf_face_px"] == 48.0
+    assert DEFAULTS["gaze"]["l2cs"]["min_face_px"] == 12.0
 
 
 def test_all_config_files_load():
@@ -481,7 +484,8 @@ def test_docs_cover_realtime_variance_and_gaze():
                   "config.yaml", "`output` stage"):
         assert topic in limits, topic
     for topic in ("confidence_ref", "headpose.eye_frame_correction", "perspective_correction",
-                  "+x points to the image left", "per gaze run", "runtime.num_threads=2", "Frame.right"):
+                  "+x points to the image left", "per gaze run", "runtime.num_threads=2", "Frame.right",
+                  "full_conf_face_px", "min_face_px", "tracking.box"):
         assert topic in readme, topic
     assert "not confirmed" not in readme
     bullets = re.split(r"\n(?=- )", readme)

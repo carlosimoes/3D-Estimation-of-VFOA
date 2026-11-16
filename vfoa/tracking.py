@@ -24,7 +24,7 @@ __all__ = ["iou_matrix", "box_iou", "PersonTracker"]
 
 _DEFAULTS: dict[str, Any] = {
     "type": "byte",
-    "box": "head",
+    "box": "body",
     "iou_thr": 0.3,
     "max_age": 30,
     "high_thr": 0.5,
@@ -98,6 +98,16 @@ class PersonTracker:
     legacy wrappers can build a tracker without a :class:`vfoa.config.Config`.
     Optional keys not in the config DEFAULTS: ``motion`` (constant-velocity box
     prediction, byte only) and ``max_predict_frames``.
+
+    ``box`` (``tracking.box``) picks the box kind used for IoU matching; the
+    default is ``"body"``. A small head that moves more than about a third of
+    its width per frame has IoU below ``iou_thr`` with its previous box, so no
+    velocity is ever learnt and the person gets a new id on every frame (the
+    fast profile on museum.mp4: 258 ids over 552 frames on head boxes, 47 on
+    body boxes). When the preferred kind is missing on the track or on the
+    detection, the other kind is used, so head-only detections (for example
+    from thesis_final/BoxTracker.py) are still tracked. The thesis profile
+    keeps ``"head"``.
     """
 
     def __init__(self, cfg: Optional[Mapping[str, Any]] = None, **overrides: Any) -> None:
