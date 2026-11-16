@@ -23,7 +23,7 @@ REPO = Path(__file__).resolve().parents[1]
 STAGES = ("depth", "persons", "tracking", "headpose", "gaze", "segmentation", "scene", "smoothing",
           "attention", "total")
 META_KEYS = {"profile", "input", "frames", "warmup", "resolution", "config_hash", "python", "numpy", "opencv",
-             "torch", "ultralytics", "cpu_count", "date", "backends", "fallbacks"}
+             "torch", "ultralytics", "cpu_count", "date", "backends", "fallbacks", "env"}
 STAT_KEYS = {"runs", "mean_ms", "p50_ms", "p95_ms", "max_ms", "per_frame_ms", "total_ms", "share"}
 
 
@@ -70,6 +70,8 @@ def test_synthetic_structure(bench, tmp_path, capsys):
     assert meta["frames"] == 12 and meta["warmup"] == 3
     assert re.fullmatch(r"[0-9a-f]{16}", meta["config_hash"])
     assert set(meta["backends"].values()) == {"synthetic"} and meta["fallbacks"] == {}
+    assert set(meta["env"]) == {"OMP_NUM_THREADS", "OMP_WAIT_POLICY", "MKL_NUM_THREADS"}
+    assert all(v is None or isinstance(v, str) for v in meta["env"].values())
     timing = data["timing"]
     assert timing["frames"] == 12 and math.isfinite(timing["fps"]) and timing["fps"] > 0
     stages = timing["stages"]
@@ -126,6 +128,21 @@ def test_fast_profile_skips_without_ultralytics(bench, tmp_path, capsys, monkeyp
     assert data["status"] == "skipped"
     assert "ultralytics" in data["reason"]
     assert data["timing"] == {} and data["meta"]["profile"] == "fast"
+
+
+def test_l2cs_without_weights_falls_back_to_head_proxy(bench, tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("VFOA_WEIGHTS_DIR", raising=False)
+    monkeypatch.setenv("OMP_WAIT_POLICY", "PASSIVE")
+    code, text, data = _run(
+        bench, tmp_path, capsys, "--profile", "synthetic", "--frames", "6", "--warmup", "2",
+        "--set", "gaze.backend=l2cs", "--set", "gaze.fallback=head_proxy",
+        "--set", "models.allow_download=false", "--set", f"models.weights_dir={tmp_path / 'noweights'}",
+    )
+    assert code == 0 and data["status"] == "ok"
+    assert data["meta"]["fallbacks"] == {"gaze": {"from": "l2cs", "to": "head_proxy"}}
+    assert data["meta"]["env"]["OMP_WAIT_POLICY"] == "PASSIVE"
+    assert re.search(r"^NOTE:", text, re.M)
+    assert data["timing"]["stages"]["gaze"]["runs"] == 6
 
 
 def test_stereo_synth_exercises_stereo_bm(bench, tmp_path, capsys, sintel_paths):
@@ -210,7 +227,7 @@ FILE_SECTIONS = {
     "vfoa/backends/accurate/gaze360.py": ("gaze", "input", "runtime", "persons"),
     "vfoa/backends/accurate/openpose_densepose.py": ("persons",),
     "vfoa/backends/accurate/panoptic_fpn.py": ("segmentation",),
-    "vfoa/backends/fast/_ultra.py": ("models",),
+    "vfoa/backends/fast/_ultra.py": ("models", "runtime"),
     "vfoa/backends/fast/head_proxy_gaze.py": ("gaze",),
     "vfoa/backends/fast/keypoints_headpose.py": ("headpose", "camera", "persons"),
     "vfoa/backends/fast/l2cs_gaze.py": ("gaze", "models", "runtime"),
@@ -223,6 +240,7 @@ ALLOW = {
     "vfoa/backends/accurate/gaze360.py": {"state_dict"},
     "vfoa/backends/accurate/panoptic_fpn.py": {"category_id", "isthing", "score"},
     "vfoa/backends/base.py": {"VFOA_WEIGHTS_DIR"},
+    "vfoa/backends/fast/_ultra.py": {"torch"},  # sys.modules.get("torch")
     "vfoa/cache.py": {"complete", "config", "disparity", "fingerprint", "format_version", "key", "n_frames", "stage"},
     "vfoa/cli.py": {"async", "latency"},
     "vfoa/pipeline.py": {"latency"},

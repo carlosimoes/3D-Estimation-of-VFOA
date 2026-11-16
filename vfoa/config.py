@@ -291,6 +291,9 @@ DEFAULTS: dict = {
     },
     "runtime": {
         "lookahead_frames": 0,
+        # null -> library defaults, except that the YOLO backends cap torch at half the
+        # logical CPUs on CPU; an int sets torch threads for the YOLO models and
+        # intra_op_num_threads for the ONNX Runtime sessions (l2cs, FSA-Net).
         "num_threads": None,
         "seed": 0,
         "log_every": 100,

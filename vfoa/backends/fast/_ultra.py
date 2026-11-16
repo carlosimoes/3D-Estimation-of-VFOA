@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -34,6 +35,7 @@ __all__ = [
     "import_yolo",
     "resolve_weights",
     "load_yolo",
+    "apply_torch_threads",
     "predict",
     "to_numpy",
 ]
@@ -104,6 +106,15 @@ def load_yolo(cfg: Mapping[str, Any], model: str, config_key: str, **warmup_kwar
     ``warmup_kwargs`` are passed to :func:`predict` for the warm-up (e.g.
     ``imgsz``, ``device``). Construction errors (including failed downloads)
     raise :class:`BackendUnavailable`.
+
+    After the warm-up, torch's intra-op thread count is set by
+    :func:`apply_torch_threads`. ultralytics' ``select_device()`` calls
+    ``torch.set_num_threads(min(8, cpu_count - 1))`` at the first predict;
+    with OpenMP's default active waiting on a shared CPU (and ONNX Runtime
+    threads spinning beside it) that made each YOLO11n call 25x slower
+    (2-3 s instead of about 0.1 s) on an 8-vCPU WSL2 VM. Setting the
+    variable ``OMP_WAIT_POLICY`` here would be too late, because
+    :func:`vfoa.backends.base.resolve_device` has already imported torch.
     """
     YOLO = import_yolo()
     path = resolve_weights(cfg, model, config_key)
@@ -118,7 +129,40 @@ def load_yolo(cfg: Mapping[str, Any], model: str, config_key: str, **warmup_kwar
         predict(yolo, np.zeros((64, 64, 3), dtype=np.uint8), **warmup_kwargs)
     except Exception as exc:  # warm-up is best effort; real errors surface on use
         log.warning("YOLO warm-up of %s failed: %r", path, exc)
+    apply_torch_threads(cfg, warmup_kwargs.get("device"))
     return yolo
+
+
+def apply_torch_threads(cfg: Mapping[str, Any], device: Optional[str] = None) -> Optional[int]:
+    """Set torch's intra-op thread count after ultralytics has changed it.
+
+    Rules: ``runtime.num_threads`` set -> ``torch.set_num_threads(n)``; else,
+    on CPU (``device`` is ``None`` or starts with ``"cpu"``) ->
+    ``max(1, min(torch.get_num_threads(), cpu_count // 2))``, because
+    YOLO11n gains almost nothing beyond 2-4 threads while more threads
+    spin-wait against the other models; else (a GPU device) nothing.
+    torch is taken from ``sys.modules`` only (never imported here); without
+    it nothing happens. Returns the value set, or ``None``.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return None
+    n = (cfg.get("runtime") or {}).get("num_threads")
+    try:
+        if n:
+            value = int(n)
+            reason = "runtime.num_threads"
+        elif device is None or str(device).lower().startswith("cpu"):
+            value = max(1, min(int(torch.get_num_threads()), (os.cpu_count() or 2) // 2))
+            reason = "CPU default: half the logical CPUs (runtime.num_threads is null)"
+        else:
+            return None
+        torch.set_num_threads(value)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("Cannot set torch threads: %r", exc)
+        return None
+    log.info("YOLO: torch intra-op threads set to %d (%s)", value, reason)
+    return value
 
 
 def predict(model: Any, image: np.ndarray, device: Optional[str] = None, **kwargs: Any) -> Any:

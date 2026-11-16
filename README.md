@@ -168,7 +168,7 @@ the fast profile on the repository's Sintel clip. Every key read by the code is 
 | `cache` | `enabled`, `dir`, `mode` (readwrite/read/write), `stages`, `chunk_size` |
 | `output` | `dir`, `jsonl`, `csv`, `video`, `show` |
 | `models` | `device` (auto/cpu/cuda), `weights_dir`, `allow_download`, `third_party_root` |
-| `runtime` | `lookahead_frames`, `num_threads`, `seed`, `log_every` |
+| `runtime` | `lookahead_frames`, `num_threads` (null: library defaults, except that the YOLO backends cap torch at half the logical CPUs on CPU; an integer sets the torch threads of the YOLO models and `intra_op_num_threads` of the ONNX Runtime sessions, l2cs and FSA-Net), `seed`, `log_every` |
 | `timing` | `enabled` |
 | `synthetic` | `width`, `height`, `fps`, `n_frames`, `n_persons`, `n_objects`, `seed`, `noise_deg`, `occluder`, `cost_ms`, `sway_m` |
 
@@ -200,8 +200,11 @@ MobileOne-S0 at 448 px, on a square face crop gated on the nose plus one eye.
   differs by 25-60 degrees on the Sintel CG clip, so it is plausible but **not
   confirmed**. The entropy-based confidence is low (about 0.2-0.26), so
   `attention.fusion: confidence` under-weights gaze. The released ONNX files have a
-  static batch of 1 (one call per person, about 20-35 ms per person on this CPU),
-  hence `gaze.stride: 2` in the fast profile. Persons seen from behind get no L2CS
+  static batch of 1 (one call per person; on the 8-vCPU test machine a gaze run cost
+  about 8-15 ms per frame on museum.mp4 with the torch-thread fix), hence
+  `gaze.stride: 2` in the fast profile. The session disables ONNX Runtime's intra-op
+  spin-waiting so its threads do not compete with torch (see
+  [docs/performance.md](docs/performance.md#cpu-threading)). Persons seen from behind get no L2CS
   gaze.
 
 ## Cache and re-scoring without models
@@ -238,7 +241,15 @@ python -m vfoa run --profile fast --input 0 --realtime --set segmentation.async=
   `segmentation_async_*`), `latency` (capture-to-result ms), `async` (worker
   statistics), `cache`, `backends` and `wall_s`.
 - CPU preset (see `configs/fast.yaml`): `--set persons.stride=2 --set gaze.stride=4
-  --set segmentation.stride=30 --set segmentation.async=true`.
+  --set segmentation.stride=30 --set segmentation.async=true`. On the 8-vCPU test
+  machine the fast profile ran at 18.5 FPS on museum.mp4 with the default strides and
+  at 18-21 FPS with the CPU preset; the preset mainly lowers the average model load,
+  while async segmentation can still cause persons spikes (p95 283 ms) unless
+  `OMP_WAIT_POLICY=PASSIVE` is exported before start.
+- CPU threads: on CPU the YOLO backends cap torch at half the logical CPUs (ultralytics
+  would otherwise use `cpu_count - 1`, which spin-waits and was 25x slower on a shared
+  VM); `runtime.num_threads` overrides this. See
+  [docs/performance.md](docs/performance.md#cpu-threading).
 
 ## Benchmark
 

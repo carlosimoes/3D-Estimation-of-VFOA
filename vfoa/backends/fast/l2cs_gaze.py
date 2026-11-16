@@ -394,6 +394,15 @@ class BinnedGaze360Backend(GazeBackend):
                 ) from exc
             path = resolve_l2cs_weights(self.cfg)
             options = ort.SessionOptions()
+            # Disable intra-op spin-waiting: spinning ONNX Runtime threads contend
+            # with torch's OpenMP threads (YOLO persons/segmentation stages); on a
+            # shared CPU this measured about 2x on the persons stage.
+            add_entry = getattr(options, "add_session_config_entry", None)
+            if callable(add_entry):
+                try:
+                    add_entry("session.intra_op.allow_spinning", "0")
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.debug("l2cs gaze: cannot disable ORT spinning: %r", exc)
             threads = (self.cfg.get("runtime") or {}).get("num_threads")
             if threads:
                 options.intra_op_num_threads = int(threads)

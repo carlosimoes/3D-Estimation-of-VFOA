@@ -32,8 +32,8 @@ gaze:
 # gaze:
 #   backend: l2cs             # gaze360|l2cs|head_proxy|synthetic|none
 #   fallback: head_proxy      # used when l2cs is unavailable (no onnxruntime, no weights, offline)
-#   stride: 2                 # l2cs on CPU costs ~20-65 ms per person (MobileOne-S0 at 448 px):
-#                             # raise the stride (or use a GPU) for real-time runs
+#   stride: 2                 # l2cs on CPU: ~8-15 ms per gaze run on museum.mp4 (MobileOne-S0
+#                             # at 448 px, batch 1 = one call per person); raise it for crowds
 #   l2cs:
 #     model: mobileone_s0     # mobileone_s0|resnet18|resnet34|resnet50|mobilenetv2
 #     path: null              # explicit ONNX file; null -> <weights_dir>/<model>_gaze.onnx
@@ -54,8 +54,12 @@ gaze:
 # models:
 #   device: auto              # auto|cpu|cuda|cuda:0
 #   weights_dir: weights
+# runtime:
+#   num_threads: null         # null: YOLO caps torch at cpu_count//2 on CPU; int: torch + ONNX Runtime threads
 #
-# CPU preset (a CPU-only machine; see docs/performance.md):
+# CPU preset (a CPU-only machine; see docs/performance.md). Measured on an 8-vCPU VM with
+# museum.mp4: 18-21 FPS vs 18.5 FPS at the default strides; it lowers the average model load,
+# and with async segmentation export OMP_WAIT_POLICY=PASSIVE to avoid persons spikes:
 # persons:
 #   stride: 2
 # gaze:

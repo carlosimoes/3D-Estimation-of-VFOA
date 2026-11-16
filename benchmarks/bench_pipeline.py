@@ -475,8 +475,17 @@ def _loadavg() -> Optional[list[float]]:
         return None
 
 
+THREAD_ENV = ("OMP_NUM_THREADS", "OMP_WAIT_POLICY", "MKL_NUM_THREADS")
+
+
+def thread_env() -> dict:
+    """The thread-related environment variables (``None`` when unset)."""
+    return {k: os.environ.get(k) for k in THREAD_ENV}
+
+
 def collect_meta(args: argparse.Namespace, cfg: Any, run: Optional[dict] = None,
-                 loadavg_start: Optional[list[float]] = None, argv: Optional[Sequence[str]] = None) -> dict:
+                 loadavg_start: Optional[list[float]] = None, argv: Optional[Sequence[str]] = None,
+                 env: Optional[dict] = None) -> dict:
     """Environment and configuration metadata of a benchmark result (never imports heavy packages)."""
     from vfoa.config import config_hash  # noqa: PLC0415
 
@@ -506,6 +515,9 @@ def collect_meta(args: argparse.Namespace, cfg: Any, run: Optional[dict] = None,
         "loadavg_start": loadavg_start,
         "loadavg_end": _loadavg(),
         "argv": list(argv) if argv is not None else sys.argv[1:],
+        # Thread settings change CPU results by more than 20x; always record them. Taken
+        # at start-up by main(): importing ultralytics sets OMP_NUM_THREADS=1 in-process.
+        "env": dict(env) if env is not None else thread_env(),
     }
     torch = sys.modules.get("torch")
     if torch is not None:
@@ -621,6 +633,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     load_start = _loadavg()
+    env_start = thread_env()
     try:
         cfg = build_config(args)
     except (ValueError, FileNotFoundError) as exc:
@@ -651,7 +664,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         result["micro"] = micro_benchmarks(repeats=int(args.micro_repeats))
         for line in _micro_lines(result["micro"]):
             print(line)
-    result["meta"] = collect_meta(args, cfg, run, load_start, argv)
+    result["meta"] = collect_meta(args, cfg, run, load_start, argv, env_start)
     if args.markdown:
         print()
         print(format_markdown(result))
