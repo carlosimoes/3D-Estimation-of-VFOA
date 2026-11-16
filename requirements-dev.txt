@@ -1,2 +1,10 @@
+# Test dependencies (CI: pip install -r requirements.txt -r requirements-dev.txt).
+# Models are always faked in the tests, but some tests build fake model outputs
+# as torch tensors (accurate backends) or open an ONNX Runtime session (l2cs
+# gaze), so the CPU builds of torch and onnxruntime are needed. ultralytics,
+# open3d and model weights are NOT needed (those tests use fakes or skip).
 -r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
 pytest>=7
+torch
+onnxruntime

@@ -1,23 +1,39 @@
 # Fast real-time profile (the defaults): YOLO11-pose persons + keypoint head pose,
 # L2CS-style gaze (MobileOne-S0 ONNX, falls back to the head direction when the
-# model is unavailable), YOLO11-seg segmentation every 10 frames, constant depth
-# unless configured.
+# model is unavailable) every 2nd frame, YOLO11-seg segmentation every 10 frames,
+# constant depth unless configured.
 # Usage: python -m vfoa run --config configs/fast.yaml --input VIDEO
 profile: fast
 
+gaze:
+  stride: 2                   # l2cs is the only per-person model cost; estimates are held and smoothed
+
 # Commented knobs (uncomment to change; see vfoa/config.py for every key):
+# input:
+#   realtime: false           # true: drop frames to keep up with the source (--realtime)
+#   pace: true                # realtime on a file: replay at the native fps
 # depth:
 #   backend: stereo_bm        # stereo_bm|sintel_gt|constant|synthetic
 #   stride: 1
+#   scale: 1.0                # stereo_bm matching resolution (0.5 = 4x fewer pixels)
+#   speckle_window: 100       # stereo_bm speckle filter (0 = off)
+#   speckle_range: 2
 # persons:
 #   model: yolo11n-pose.pt
 #   imgsz: 640
 #   stride: 1
+# tracking:
+#   motion: true              # constant-velocity box prediction (byte tracker)
+#   max_predict_frames: 5
+# headpose:
+#   relaxed_kpt_thr: 0.1      # keypoints backend: weaker face keypoints still used for PnP
+#   fallback_confidence: 0.5
+#   max_reproj_frac: 0.15
 # gaze:
 #   backend: l2cs             # gaze360|l2cs|head_proxy|synthetic|none
 #   fallback: head_proxy      # used when l2cs is unavailable (no onnxruntime, no weights, offline)
-#   stride: 1                 # l2cs on CPU costs ~40-65 ms per person (MobileOne-S0 at 448 px):
-#                             # raise the stride (or use a GPU) for real-time runs
+#   stride: 2                 # l2cs on CPU: ~8-15 ms per gaze run on museum.mp4 (MobileOne-S0
+#                             # at 448 px, batch 1 = one call per person); raise it for crowds
 #   l2cs:
 #     model: mobileone_s0     # mobileone_s0|resnet18|resnet34|resnet50|mobilenetv2
 #     path: null              # explicit ONNX file; null -> <weights_dir>/<model>_gaze.onnx
@@ -29,10 +45,25 @@ profile: fast
 #   # l2cs weights are trained on Gaze360: research / non-commercial use only; never commit them.
 # segmentation:
 #   stride: 10
-#   async: false
+#   async: false              # true: run segmentation on a worker thread (real-time mode)
+# smoothing:
+#   jump_deg: 30.0            # kalman outlier gate (0 disables)
 # attention:
 #   sigma_gaze_deg: 10.0
 #   sigma_head_deg: 20.0
 # models:
 #   device: auto              # auto|cpu|cuda|cuda:0
 #   weights_dir: weights
+# runtime:
+#   num_threads: null         # null: YOLO caps torch at cpu_count//2 on CPU; int: torch + ONNX Runtime threads
+#
+# CPU preset (a CPU-only machine; see docs/performance.md). Measured on an 8-vCPU VM with
+# museum.mp4: 18-21 FPS vs 18.5 FPS at the default strides; it lowers the average model load,
+# and with async segmentation export OMP_WAIT_POLICY=PASSIVE to avoid persons spikes:
+# persons:
+#   stride: 2
+# gaze:
+#   stride: 4
+# segmentation:
+#   stride: 30
+#   async: true

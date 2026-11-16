@@ -40,3 +40,7 @@ smoothing:
 #     half_angles_gaze_deg: [11.3, 21.8]
 #     half_angles_head_deg: [12.5, 24.0]
 #   agreement_deg: 45.0
+# scene:
+#   outlier_nb_points: 11     # radius outlier filter (as open3d remove_radius_outlier)
+#   outlier_radius_m: null    # null -> outlier_radius_scale x median nearest-neighbour distance
+#   outlier_radius_scale: 4.0

@@ -14,3 +14,5 @@ depth:
 #   baseline_m: 0.1
 # segmentation:
 #   stride: 10
+# gaze:
+#   stride: 2                 # the fast-profile default; 1 = l2cs on every frame
