@@ -1,4 +1,6 @@
-# "fast" real-time profile (YOLO11 pose / segmentation).
+# "fast" real-time profile (YOLO11 pose / segmentation, L2CS-style gaze).
+# CPU-only machines can use the CPU torch wheels:
+#   pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-fast.txt
 -r requirements.txt
 torch
 # ultralytics is licensed AGPL-3.0. It is an OPTIONAL dependency: vfoa imports

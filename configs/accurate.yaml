@@ -25,6 +25,13 @@ segmentation:
 #   num_disparities: 160
 #   block_size: 15
 #   wls: auto                 # needs opencv-contrib (cv2.ximgproc)
+#   scale: 1.0                # matching resolution; 0.5 is ~4x cheaper
+#   speckle_window: 100       # 0 = off
+#   speckle_range: 2
+# persons:
+#   upper_body_only: true     # zero the OpenPose knee/ankle keypoints
+#   match_min_inside: 0.5     # skeleton-to-DensePose-instance matching threshold
+#   keep_headless: false      # keep DensePose instances without a head box
 # segmentation:
 #   stride: 1
 #   async: false

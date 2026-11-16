@@ -27,4 +27,5 @@ segmentation:
 #   n_objects: 4
 #   noise_deg: 0.0
 #   occluder: false
+#   sway_m: 0.05              # lateral sway amplitude of the persons (metres)
 #   cost_ms: {persons: 15.0, segmentation: 40.0}   # emulated model cost per call

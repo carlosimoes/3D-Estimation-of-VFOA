@@ -7,6 +7,8 @@ open3d
 matplotlib
 
 # Notes:
+# - open3d is only used by the legacy thesis_final scripts and by the optional
+#   --micro benchmark (PLY round-trip); the vfoa pipeline does not need it.
 # - The WLS disparity filter (depth.wls) needs cv2.ximgproc, which only ships in
 #   opencv-contrib-python-headless. That wheel REPLACES opencv-python-headless
 #   (uninstall the latter first); without it the WLS step is skipped.

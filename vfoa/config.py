@@ -110,6 +110,7 @@ DEFAULTS: dict = {
         "max_frames": None,
         "fps": None,
         "realtime": False,
+        "pace": True,  # input.realtime on a file: replay at the native fps (False = as fast as possible)
     },
     "camera": {
         "fx": None,
@@ -132,6 +133,8 @@ DEFAULTS: dict = {
         "min_depth_m": 0.05,
         "max_depth_m": 100.0,
         "constant_depth_m": 2.5,
+        "speckle_window": 100,  # stereo_bm speckle filter window (0 = off)
+        "speckle_range": 2,
     },
     "persons": {
         "backend": "yolo_pose",  # openpose_densepose|yolo_pose|synthetic
@@ -148,6 +151,9 @@ DEFAULTS: dict = {
         "densepose_cfg": "projects/DensePose/configs/densepose_rcnn_R_50_FPN_s1x_legacy.yaml",
         "densepose_weights": "projects/DensePose/configs/model_final_d366fa.pkl",
         "densepose_thr": 0.85,
+        "upper_body_only": True,  # openpose_densepose: zero the knee/ankle keypoints
+        "match_min_inside": 0.5,  # openpose_densepose: skeleton-to-instance matching threshold
+        "keep_headless": False,  # openpose_densepose: keep instances without a head box
     },
     "tracking": {
         "type": "byte",  # byte|greedy_iou
@@ -156,6 +162,8 @@ DEFAULTS: dict = {
         "max_age": 30,
         "high_thr": 0.5,
         "low_thr": 0.1,
+        "motion": True,  # constant-velocity box prediction (byte only)
+        "max_predict_frames": 5,
     },
     "headpose": {
         "backend": "keypoints",  # fsanet|keypoints|synthetic|none
@@ -166,6 +174,10 @@ DEFAULTS: dict = {
             "headpose-fsanet-pytorch/pretrained/fsanet-1x1-iter-688590.onnx",
             "headpose-fsanet-pytorch/pretrained/fsanet-var-iter-688590.onnx",
         ],
+        # keypoints backend (PnP on face keypoints):
+        "relaxed_kpt_thr": 0.1,
+        "fallback_confidence": 0.5,
+        "max_reproj_frac": 0.15,
     },
     "gaze": {
         "backend": "none",  # gaze360|l2cs|head_proxy|synthetic|none (the fast profile: l2cs)
@@ -219,6 +231,10 @@ DEFAULTS: dict = {
         "eye_patch_px": 3,
         "match_dist_m": 0.75,
         "object_max_age": 5,
+        "outlier_nb_points": 11,  # outlier: radius (as open3d remove_radius_outlier)
+        "outlier_radius_m": None,  # null -> outlier_radius_scale x median nearest-neighbour distance
+        "outlier_radius_scale": 4.0,
+        "self_aabb_margin_m": 0.1,  # own-segment fallback: AABB margin around the eyes
     },
     "attention": {
         "method": "angular",  # angular|rays
@@ -251,6 +267,7 @@ DEFAULTS: dict = {
         "target": "hmm",  # hmm|hysteresis|none
         "hmm_stay_prob": 0.9,
         "hysteresis_frames": 3,
+        "jump_deg": 30.0,  # outlier gate of the kalman mode (0/null disables)
     },
     "cache": {
         "enabled": False,
@@ -290,6 +307,7 @@ DEFAULTS: dict = {
         "noise_deg": 0.0,
         "occluder": False,
         "cost_ms": {},
+        "sway_m": 0.05,  # lateral sway amplitude of the persons (metres)
     },
 }
 
@@ -329,7 +347,8 @@ def _deep_merge(base: Mapping, override: Mapping) -> dict:
 
 
 PROFILES: dict = {
-    "fast": {"gaze": {"backend": "l2cs", "fallback": "head_proxy"}},
+    # gaze.stride 2: l2cs is the only per-person model cost; estimates are held and smoothed.
+    "fast": {"gaze": {"backend": "l2cs", "fallback": "head_proxy", "stride": 2}},
     "accurate": _deep_merge({}, _ACCURATE),
     "thesis": _deep_merge(_ACCURATE, _THESIS_EXTRA),
     "synthetic": {
