@@ -61,9 +61,12 @@ gaze:
 #                             # int: torch + ONNX Runtime threads; 2 is a good value on a shared CPU
 #
 # CPU preset (a CPU-only machine; see docs/performance.md). Measured on an 8-vCPU VM with
-# museum.mp4 (2026-11-16, 2 torch threads by the async default): 17-24 FPS vs 13-19 FPS at the
-# default strides on a quiet machine; it lowers the average model load. With the async thread
-# cap there are no persons spikes, so OMP_WAIT_POLICY=PASSIVE is no longer needed:
+# museum.mp4 (2026-11-16, 2 torch threads by the async default): 17-18 FPS (19-24 FPS with
+# OMP_WAIT_POLICY=PASSIVE). The default strides gave 13-19 FPS on a quiet machine (earlier
+# runs) and 2-7 FPS in the same session as these preset runs (fast-museum.json,
+# fast-museum-2.json). The preset lowers the average model load. With the async thread cap
+# PASSIVE is no longer needed to avoid persons spikes; it was 40% and 2% faster in two pairs
+# with async segmentation, but slower with the default strides (11.99 vs 18.50 FPS):
 # persons:
 #   stride: 2
 # gaze:

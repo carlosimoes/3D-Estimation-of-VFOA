@@ -227,7 +227,10 @@ MobileOne-S0 at 448 px, on a square face crop gated on the nose plus one eye.
   profile. The session disables ONNX Runtime's intra-op spin-waiting so its threads
   do not compete with torch (see
   [docs/performance.md](docs/performance.md#cpu-threading)).
-- Persons seen from behind get no L2CS gaze (no face gate); they fall back to head pose.
+- A person who does not pass the face gate (nose plus one eye, `gaze.l2cs.kpt_thr`) gets
+  no L2CS gaze; attention then uses the head direction alone when a head pose exists.
+  Seen from behind, the keypoint head pose of the fast profile has no estimate either
+  (it needs the nose plus three more face keypoints), so that person is not scored.
 
 ## Cache and re-scoring without models
 
@@ -278,16 +281,20 @@ python -m vfoa run --profile fast --input 0 --realtime --set segmentation.async=
   default, against 0.8-1.3 FPS with the old 4-thread default (one run at a time,
   2026-11-16; see [docs/performance.md](docs/performance.md#real-time-mode)).
 - CPU preset (see `configs/fast.yaml`): `--set persons.stride=2 --set gaze.stride=4
-  --set segmentation.stride=30 --set segmentation.async=true`: 17-24 FPS on museum.mp4
-  with the current thread default, without the persons spikes seen before the async
-  thread cap, so `OMP_WAIT_POLICY=PASSIVE` is no longer needed.
+  --set segmentation.stride=30 --set segmentation.async=true`: 17-18 FPS on museum.mp4
+  with the current thread default (19-24 FPS with `OMP_WAIT_POLICY=PASSIVE`), without
+  the persons spikes seen before the async thread cap, so PASSIVE is no longer needed
+  to avoid them. In the two pairs measured it was still 40% and 2% faster with async
+  segmentation; with the default strides (synchronous segmentation) it was slower
+  (11.99 against 18.50 FPS). See
+  [docs/performance.md](docs/performance.md#cpu-preset).
 - CPU threads: on CPU the YOLO backends cap torch at half the logical CPUs, or a
   quarter when `segmentation.async` is true, because the frame loop and the
   segmentation worker then run two torch thread pools (ultralytics would otherwise use
   `cpu_count - 1`, which spin-waits and was 25x slower on a shared VM).
   `runtime.num_threads` overrides this; **when the machine is shared, use
   `--set runtime.num_threads=2`** (under load it beat the 4-thread default: 7.9 against
-  5.1-5.8 FPS). See [docs/performance.md](docs/performance.md#cpu-threading).
+  5.1-5.8 FPS, verification). See [docs/performance.md](docs/performance.md#cpu-threading).
 
 ## Benchmark
 
@@ -329,8 +336,8 @@ Numbers marked "(verification, 2026-11-16)" come from the verification run of th
   depth backend does not exist yet.
 - **The thesis ray method misses small objects.** `attention.method=rays` (the thesis
   profile) casts rays on rings at 11.3 and 21.8 degrees around the gaze (12.5 and 24.0
-  around the head direction), with no centre ray, as in the thesis. An object that subtends less than the inner ring and is
-  looked at directly gets no hits: 0 of 240 targets on the synthetic scene
+  around the head direction), with no centre ray, as in the thesis. An object that
+  subtends less than the inner ring and is looked at directly gets no hits: 0 of 240 targets on the synthetic scene
   (verification, 2026-11-16). Use angular scoring (`attention.method: angular`, the
   default of the other profiles).
 - **The accurate backends were never run with the real thesis models** (detectron2,
@@ -377,7 +384,7 @@ available on the development machine).
 | #32 | No PLY round-trip, a single (optionally scaled) StereoBM, models loaded once, streamed video (see `--micro`) |
 | #35 | Fast backends, multi-rate stages, real-time mode, asynchronous segmentation, benchmark |
 | #2, #7 (follow-up) | Gaze360 axes: the eye frame has +x to the image left, so the camera vector is (-g.x, -g.y, g.z) (a rotation; it was mirrored left-right); gaze360, l2cs and FSA-Net share one eye-ray correction (`geometry.ray_aligned`) |
-| #35, #32 (follow-up) | CPU torch thread cap: a quarter of the logical CPUs with `segmentation.async` (two torch pools), half otherwise; real-time mode on museum.mp4 went from under 1 FPS to several FPS (see [docs/performance.md](docs/performance.md#real-time-mode)) |
+| #35, #32 (follow-up) | CPU torch thread cap: a quarter of the logical CPUs with `segmentation.async` (two torch pools), half otherwise; real-time mode on museum.mp4 went from 0.8-1.3 to 6.0-8.3 FPS in this update's runs (see [docs/performance.md](docs/performance.md#real-time-mode)) |
 | optional | #10 detectors see the original image, #11 replaced by the scene builder, #13 single device, no process pools, #18 ByteTrack-style tracking, #21 confidence-weighted fusion, #31 structured JSONL/CSV outputs with frame timestamps |
 
 Note: adding the reconciled config keys to `DEFAULTS` changes the stage-cache keys

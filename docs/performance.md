@@ -110,8 +110,8 @@ threads (`meta.torch_threads`, the CPU default described under "CPU threading").
 python benchmarks/bench_pipeline.py --profile fast --input Final_videos/museum.mp4 --frames 30 --warmup 5
 ```
 
-1280x720, 30 frames after 5 warm-up, load average 4.1 -> 4.3. **18.50 FPS** (quiet
-machine: no other CPU-bound job was running; see "Run-to-run variance" for a loaded one).
+1280x720, 30 frames after 5 warm-up, load average 4.1 -> 4.3. **18.50 FPS** (the
+quiet-machine figure; see "Run-to-run variance" for a loaded machine).
 
 | stage | runs | mean ms | p50 ms | p95 ms | max ms | ms/frame | share |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -169,7 +169,8 @@ here, not computation.
 The model runs depend on what else the 8-vCPU VM (and the Windows host under it) is
 doing. All rows below are the museum command above (fast profile, 30 frames after 5
 warm-up, 4 torch threads, the default), on the same day, with the source of each
-figure:
+figure. The JSON file names quoted in the tables of this update (`fast-museum.json`,
+`preset*.json`, `rt-*.json`) are run labels; the files are not kept in the repository.
 
 | source | FPS | load average at start |
 |---|---|---|
@@ -178,9 +179,11 @@ figure:
 | review of benchmark-docs, later, while other jobs ran | 4.53, 3.18, 3.68, 3.63 | 4.4 for the 4.53 run |
 | verification of the branch | 3.26, 5.79, 5.13 | 5.5-10 |
 | this document's update (`fast-museum.json`, `fast-museum-2.json`) | 6.61, 2.07 | 2.95, 2.71 |
+| review of this update | 8.29, 8.96, 10.02 | 2.28, 3.32, 4.39 |
 
 - **13-19 FPS on a quiet machine, 3-8 FPS when other CPU-bound jobs run** (and as low as
-  2 FPS in one run). The quiet-machine figure used elsewhere in this document is
+  2 FPS in one run). Intermediate values occur too: 8-10 FPS at a load of 2.3-4.4 in
+  the review of this update. The quiet-machine figure used elsewhere in this document is
   **18.50 FPS**.
 - The recorded load average is only a rough indicator: 13.9 FPS was measured at a load
   of 7.9 and 4.5 FPS at 4.4 (review), and this update's two runs started below 3 but
@@ -224,8 +227,9 @@ took 2-3 s instead of tens of milliseconds.
   machine use `--set runtime.num_threads=2`**: under load it was the fastest setting
   (see "Run-to-run variance").
 - `export OMP_WAIT_POLICY=PASSIVE` before starting Python (it must be set before torch
-  is imported, so setting it from vfoa code is too late). See "CPU preset" for when it
-  still helps.
+  is imported, so setting it from vfoa code is too late). With the default strides
+  (synchronous segmentation) it was slower: 11.99 against 18.50 FPS (table below). With
+  `segmentation.async` it can still help; see "CPU preset".
 
 **Before / after** (fast profile, museum.mp4, 30 frames after 5 warm-up):
 
@@ -301,18 +305,29 @@ at a time:
 | `preset-2.json` | 2 | unset | 2.70 -> 4.14 | 18.32 | 67.75 / 114.76 / 154.23 | 195.6 |
 
 The persons spikes are gone with the default: p95 is below 2 x p50 (before the cap:
-p50 27 ms, p95 283 ms, max 645 ms). PASSIVE was 40% faster in the first pair and 2% in
-the second, i.e. within the run-to-run variance, so **`OMP_WAIT_POLICY=PASSIVE` is no
-longer needed with the default thread cap**; it remains a harmless option to try on a
-busy machine. On this machine the default strides reach 13-19 FPS on museum.mp4 when it
+p50 27 ms, p95 283 ms, max 645 ms). Persons p50 is 68-73 ms (27 ms before the cap) and
+the mean 78-82 ms (78 ms before), so the cap removed the spikes but did not raise the
+throughput (17-18 against 20.89 FPS, measured at different times).
+
+- **`OMP_WAIT_POLICY=PASSIVE` is no longer needed to avoid the persons spikes**: without
+  it persons p95 is 113-115 ms and max 152-154 ms, against 283 ms and 645 ms before the
+  cap.
+- In the two pairs measured, PASSIVE was 40% and 2% faster (persons p95 73 and 103 ms
+  against 113 and 115 ms; worker mean 107 and 139 ms against 177 and 196 ms), so it can
+  still help with async segmentation; two pairs do not settle it.
+- With the default strides (synchronous segmentation) PASSIVE was slower: 11.99 against
+  18.50 FPS (see "CPU threading").
+
+On this machine the default strides reach 13-19 FPS on museum.mp4 when it
 is quiet, so the preset brings little extra average throughput; it is meant for slower
 CPUs and scenes with more people.
 
 ### Observations
 
 - **Persons dominates.** With the default strides YOLO11n-pose is about 65-70% of the
-  frame time on museum.mp4 (the 18.50 FPS quiet-machine run); all non-model stages together (tracking, head pose,
-  scene, smoothing, attention) cost about 5-6 ms per frame.
+  frame time on museum.mp4 (the 18.50 FPS quiet-machine run); all non-model stages
+  together (tracking, head pose, scene, smoothing, attention) cost about 5-6 ms per
+  frame.
 - **Threading matters more than the model.** See "CPU threading": without the cap on
   torch threads and with ONNX Runtime spinning, the same profile ran at 0.3 FPS.
 
@@ -352,8 +367,9 @@ How to read it:
   worker's own time is in `run.async.segmentation` (`completed`, `mean_ms`).
 
 **Before / after the async thread cap**, measured in this update one run at a time
-(JSON files `rt-*.json`; same 8-vCPU VM, no other job running; the load at start
-includes the tail of the previous run). The "4 threads" rows use
+(JSON files `rt-*.json`; same 8-vCPU VM, one benchmark at a time; other processes on
+the VM or the Windows host were not excluded (before `rt-default-2.json` the load
+average stayed above 3 for three minutes although no benchmark was running)). The "4 threads" rows use
 `--set runtime.num_threads=4`, the CPU default before the cap; the "default" rows use
 no thread setting (2 threads: a quarter of 8 logical CPUs):
 
@@ -372,7 +388,10 @@ to their max. Earlier figures for the same command, from other runs on the same 
   persons 1127 ms;
 - task fu-rt-cpu-threads (load average 5-9): 4 threads 2.05 FPS, persons mean 451 ms,
   worker 853 ms; 2 threads 9.8-11.0 FPS, persons 60-69 ms, worker 111-135 ms;
-  1 thread 8.2 FPS.
+  1 thread 8.2 FPS;
+- review of this update, default (2 torch threads): 9.39 FPS, 99 processed / 146
+  dropped of 245, persons mean 68.95 ms, p95 104.54 ms, worker mean 131.8 ms, latency
+  p95 197.8 ms, load 1.80 -> 2.79.
 
 **Cause.** torch's thread count is process-global, but every thread that calls torch
 gets its own OpenMP team. In real-time mode the frame loop (YOLO11n-pose) and the
@@ -389,8 +408,8 @@ frames `segmentation.stride: 10` means
 "every 10 / fps seconds" (0.42 s at 23.98 fps), not "every 10th processed frame". On
 a slow CPU segmentation is then due on almost every processed frame: in `rt-t4-1.json`
 the worker was handed 8 jobs in 12 processed frames, and 11 in 15 in `rt-t4-2.json`.
-`gaze.stride: 2` likewise: L2CS ran on every measured frame in all five runs (7 of 7,
-10 of 10, 58 of 58, 78 of 78) except `rt-t1.json` (74 of 78). Raise the strides (see
+`gaze.stride: 2` likewise: L2CS ran on every measured frame in four of the five runs
+(7 of 7, 10 of 10, 58 of 58, 78 of 78), and on 74 of 78 in `rt-t1.json`. Raise the strides (see
 "CPU preset") when the processing rate is far below the source rate.
 
 ## Micro-benchmarks of the #32 fixes
