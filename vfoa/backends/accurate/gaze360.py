@@ -12,9 +12,14 @@ real temporal context (past frames, and future frames when the pipeline runs
 with ``runtime.lookahead_frames``) instead of the same frame 7 times (Refs #7).
 ``gaze.window: static`` reproduces the thesis behaviour (7 copies of frame t).
 All persons go through one batched forward pass; the ImageNet normalisation
-happens on the device. Outputs (yaw, pitch in radians) are converted with
-:func:`vfoa.geometry.gaze360_to_camera` (optional eye-ray correction); an
-uncertainty above ``gaze.uncertainty_thr`` gives no estimate.
+happens on the device. Outputs (yaw, pitch in radians) follow the Gaze360
+dataset convention (eye frame +x image-left, +y up, +z away from the camera;
+``t = p = 0`` looks into the camera, +yaw turns towards the image left, +pitch
+looks up) and are converted with :func:`vfoa.geometry.gaze360_to_camera`, i.e.
+``(-cos p sin t, -sin p, -cos p cos t)`` in the camera frame. Gaze360 predicts
+gaze relative to the camera -> eye ray, so ``gaze.eye_frame_correction`` (on by
+default) rotates that vector into the frame of the ray through the eye pixel.
+An uncertainty above ``gaze.uncertainty_thr`` gives no estimate.
 
 torch and the gaze360 repository are imported lazily; the model factory is
 injectable for tests.

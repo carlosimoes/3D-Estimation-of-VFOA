@@ -8,6 +8,13 @@ the upstream FSA-Net demo (Refs #8; the thesis used ``(x - 447.5) / 448``). The
 camera-frame forward vector with :func:`vfoa.geometry.euler_to_forward`
 (Refs #2; the thesis used the raw angles as a 3D vector).
 
+Like Gaze360, FSA-Net sees only a head crop, so its angles are relative to the
+camera -> eye ray. With ``headpose.eye_frame_correction`` (default true) and
+known ``frame.intrinsics`` the forward vector is rotated into the frame of the
+ray through ``person.eyes_px`` (else :func:`vfoa.geometry.eye_pixel` of the
+head box / keypoints) with :func:`vfoa.geometry.ray_aligned`, so head pose and
+gaze share one frame. ``euler_deg`` always keeps the raw model output.
+
 onnxruntime is imported lazily; the session factory is injectable for tests.
 """
 
@@ -21,7 +28,7 @@ import numpy as np
 
 from vfoa.backends.accurate._thirdparty import ENV_VAR, resolve_path
 from vfoa.backends.base import BackendUnavailable, HeadPoseBackend, resolve_device
-from vfoa.geometry import euler_to_forward
+from vfoa.geometry import euler_to_forward, eye_pixel, ray_aligned, unproject
 from vfoa.types import DirectionEstimate, Frame, Person
 
 __all__ = ["crop_head", "preprocess_head", "FSANetHeadPose", "INPUT_SIZE"]
@@ -123,6 +130,14 @@ class FSANetHeadPose(HeadPoseBackend):
             except Exception:  # pragma: no cover - defensive
                 pass
         options = ort.SessionOptions()
+        # Disable intra-op spin-waiting (contends with torch's OpenMP threads),
+        # as in the l2cs gaze backend.
+        add_entry = getattr(options, "add_session_config_entry", None)
+        if callable(add_entry):
+            try:
+                add_entry("session.intra_op.allow_spinning", "0")
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("FSA-Net: cannot disable ORT spinning: %r", exc)
         threads = (self.cfg.get("runtime") or {}).get("num_threads")
         if threads:
             options.intra_op_num_threads = int(threads)
@@ -154,6 +169,7 @@ class FSANetHeadPose(HeadPoseBackend):
         """Head direction per track id; persons without a usable head box are absent."""
         self.load()
         out: dict[int, DirectionEstimate] = {}
+        correct = bool(self.section.get("eye_frame_correction", True)) and frame.intrinsics is not None
         for p in persons:
             crop = crop_head(frame.image, p.detection.head_box)
             if crop is None:
@@ -166,8 +182,15 @@ class FSANetHeadPose(HeadPoseBackend):
             ypr = np.mean(np.vstack(results), axis=0)[:3]
             if ypr.shape != (3,) or not np.isfinite(ypr).all():
                 continue
+            eye_ray = None
+            if correct:
+                uv = p.eyes_px
+                if uv is None:
+                    uv = eye_pixel(p.detection.head_box, p.detection.keypoints)
+                if uv is not None:
+                    eye_ray = unproject(np.asarray(uv, dtype=np.float64), 1.0, frame.intrinsics)
             out[p.track_id] = DirectionEstimate(
-                direction=euler_to_forward(ypr[0], ypr[1], ypr[2]),
+                direction=ray_aligned(euler_to_forward(ypr[0], ypr[1], ypr[2]), eye_ray),
                 confidence=1.0,
                 euler_deg=ypr,
                 frame_index=frame.index,

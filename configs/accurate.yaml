@@ -28,6 +28,10 @@ segmentation:
 #   scale: 1.0                # matching resolution; 0.5 is ~4x cheaper
 #   speckle_window: 100       # 0 = off
 #   speckle_range: 2
+# headpose:
+#   eye_frame_correction: true   # FSA-Net angles are relative to the camera -> eye ray
+# gaze:
+#   eye_frame_correction: true   # Gaze360 gaze is relative to the camera -> eye ray
 # persons:
 #   upper_body_only: true     # zero the OpenPose knee/ankle keypoints
 #   match_min_inside: 0.5     # skeleton-to-DensePose-instance matching threshold

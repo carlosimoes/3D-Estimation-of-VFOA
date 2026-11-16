@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from vfoa import geometry
 from vfoa.backends import create_backend, create_backend_with_fallback
 from vfoa.backends.base import BackendUnavailable
 from vfoa.backends.fast import l2cs_gaze as L
@@ -35,6 +36,7 @@ from vfoa.backends.fast.l2cs_gaze import (
     preprocess,
     resolve_l2cs_weights,
 )
+from vfoa.geometry import unproject
 from vfoa.types import Frame, Intrinsics, Person, PersonDetection
 
 S = 448
@@ -158,6 +160,16 @@ def test_positive_b_is_image_up():
     assert d[1] < 0 and abs(d[0]) < 1e-12 and d[2] < 0
 
 
+def test_angles_to_direction_matches_geometry(rng):
+    a = rng.uniform(-np.pi, np.pi, 200)
+    b = rng.uniform(-np.pi / 2, np.pi / 2, 200)
+    d = angles_to_direction(a, b)
+    assert d.shape == (200, 3)
+    np.testing.assert_allclose(d, geometry.gaze360_to_camera(a, b), atol=1e-12)
+    closed = np.stack([-np.cos(b) * np.sin(a), -np.sin(b), -np.cos(b) * np.cos(a)], axis=1)
+    np.testing.assert_allclose(d, closed, atol=1e-12)
+
+
 def test_unit_norm(rng):
     d = angles_to_direction(rng.uniform(-np.pi, np.pi, 500), rng.uniform(-np.pi / 2, np.pi / 2, 500))
     assert d.dtype == np.float64
@@ -166,7 +178,7 @@ def test_unit_norm(rng):
 
 def test_output_order_positional(make_config, tmp_path):
     sess = FakeSession(const_outputs(20.0, 0.0), names=("pitch", "yaw"))
-    be = backend(make_config, tmp_path, sess)
+    be = backend(make_config, tmp_path, sess, perspective_correction=False)
     est = be.estimate(make_frame(), [make_person(1, 160, 120)])[1]
     assert est.euler_deg[0] == pytest.approx(20.0) and est.euler_deg[1] == pytest.approx(0.0)
     assert est.direction[0] < 0 and abs(est.direction[1]) < 1e-9  # first output = a (horizontal)
@@ -177,7 +189,7 @@ def test_backend_signs_end_to_end(make_config, tmp_path):
     for (a, b), check in [((0, 0), lambda d: np.allclose(d, [0, 0, -1], atol=1e-9)),
                           ((40, 0), lambda d: d[0] < 0), ((-40, 0), lambda d: d[0] > 0),
                           ((0, 40), lambda d: d[1] < 0), ((0, -40), lambda d: d[1] > 0)]:
-        be = backend(make_config, tmp_path, FakeSession(const_outputs(a, b)))
+        be = backend(make_config, tmp_path, FakeSession(const_outputs(a, b)), perspective_correction=False)
         d = be.estimate(make_frame(), [make_person(1, 160, 120)])[1].direction
         assert check(d), (a, b, d)
         assert np.linalg.norm(d) == pytest.approx(1.0)
@@ -350,9 +362,9 @@ def test_perspective_correction(make_config, tmp_path):
     off = make_person(1, 290, 40)
     centred = make_person(2, intr.cx, intr.cy - 0.3 * 20 / 2)  # crop centre close to the principal point
 
-    plain = backend(make_config, tmp_path, FakeSession(const_outputs())).estimate(frame, [off, centred])
-    corr = backend(make_config, tmp_path, FakeSession(const_outputs()),
-                   perspective_correction=True).estimate(frame, [off, centred])
+    plain = backend(make_config, tmp_path, FakeSession(const_outputs()),
+                    perspective_correction=False).estimate(frame, [off, centred])
+    corr = backend(make_config, tmp_path, FakeSession(const_outputs())).estimate(frame, [off, centred])
     np.testing.assert_allclose(plain[1].direction, [0, 0, -1], atol=1e-9)
     assert np.degrees(np.arccos(np.clip(corr[1].direction @ plain[1].direction, -1, 1))) > 20
     assert corr[1].direction[0] < 0 and corr[1].direction[1] > 0  # points back towards the camera
@@ -363,6 +375,73 @@ def test_perspective_correction(make_config, tmp_path):
     out = backend(make_config, tmp_path, FakeSession(const_outputs()),
                   perspective_correction=True).estimate(make_frame(), [off])
     assert 1 in out
+
+
+def test_default_correction_uses_eye_ray(make_config, tmp_path):
+    intr = Intrinsics.from_hfov(320, 240, 90.0)
+    frame = make_frame(intrinsics=intr)
+    person = make_person(1, 290, 40)
+    box = face_crop_box(person.detection.keypoints, person.detection.head_box, 0.5, 1.1)
+    centre = np.array([0.5 * (box[0] + box[2]), 0.5 * (box[1] + box[3])])
+
+    def unit(v):
+        v = np.asarray(v, dtype=np.float64)
+        return v / np.linalg.norm(v)
+
+    d = backend(make_config, tmp_path, FakeSession(const_outputs())).estimate(frame, [person])[1].direction
+    np.testing.assert_allclose(d, -unit(unproject(centre, 1.0, intr)), atol=1e-9)
+    person.eyes_px = np.array([280.0, 50.0], np.float32)
+    d = backend(make_config, tmp_path, FakeSession(const_outputs())).estimate(frame, [person])[1].direction
+    np.testing.assert_allclose(d, -unit(unproject(np.array([280.0, 50.0]), 1.0, intr)), atol=1e-9)
+    d = backend(make_config, tmp_path, FakeSession(const_outputs()),
+                perspective_correction=False).estimate(frame, [person])[1].direction
+    np.testing.assert_allclose(d, [0, 0, -1], atol=1e-9)
+
+
+def _certainty(z):
+    z = np.asarray(z, dtype=np.float64)
+    p = np.exp(z - z.max())
+    p /= p.sum()
+    ent = -np.sum(np.where(p > 0, p * np.log(np.where(p > 0, p, 1.0)), 0.0))
+    return 1.0 - ent / math.log(90)
+
+
+def _logits_with_certainty(c):
+    """``s * onehot(45)`` with ``1 - H(softmax) / log(90) == c`` (bisection on ``s``)."""
+    lo, hi = 0.0, 60.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        z = np.zeros(90)
+        z[45] = mid
+        if _certainty(z) < c:
+            lo = mid
+        else:
+            hi = mid
+    z = np.zeros(90)
+    z[45] = 0.5 * (lo + hi)
+    return z
+
+
+def test_confidence_ref(make_config, tmp_path):
+    vis = face_visible(make_person(1, 160, 120).detection.keypoints, 0.5)
+    assert vis == pytest.approx(0.9)
+
+    def conf_for(c, **l2cs):
+        z = _logits_with_certainty(c)
+        assert _certainty(z) == pytest.approx(c, abs=1e-9)
+        fn = lambda x: (np.tile(z, (len(x), 1)), np.tile(z, (len(x), 1)))  # noqa: E731
+        be = backend(make_config, tmp_path, FakeSession(fn), **l2cs)
+        return be.estimate(make_frame(), [make_person(1, 160, 120)])[1].confidence
+
+    assert conf_for(0.25) == pytest.approx(vis, abs=1e-4)
+    assert conf_for(0.125) == pytest.approx(0.5 * vis, abs=1e-4)
+    assert conf_for(0.5) == pytest.approx(vis, abs=1e-4)
+    assert conf_for(0.25, confidence_ref=None) == pytest.approx(0.25 * vis, abs=1e-4)
+    assert conf_for(0.25, confidence_ref=0) == pytest.approx(0.25 * vis, abs=1e-4)
+    assert conf_for(0.125, confidence_ref=0.5) == pytest.approx(0.25 * vis, abs=1e-4)
+    uniform = lambda x: (np.zeros((len(x), 90)), np.zeros((len(x), 90)))  # noqa: E731
+    out = backend(make_config, tmp_path, FakeSession(uniform)).estimate(make_frame(), [make_person(1, 160, 120)])
+    assert out[1].confidence == pytest.approx(0.0, abs=1e-9)
 
 
 # ---------------------------------------------------------------------- availability

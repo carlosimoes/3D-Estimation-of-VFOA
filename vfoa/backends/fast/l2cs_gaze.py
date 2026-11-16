@@ -28,21 +28,37 @@ Pipeline per frame (``estimate``):
    The outputs are taken BY POSITION (first = ``a``, second = ``b``): the
    L2CS repository names them inconsistently (its ``forward`` returns yaw
    first, ``train.py`` unpacks pitch first), so names are never used.
-5. Direction in the OpenCV camera frame (+x right, +y down, +z forward)::
+5. Direction in the OpenCV camera frame (+x right, +y down, +z forward), the
+   Gaze360 label convention shared with the accurate backend
+   (:func:`vfoa.geometry.gaze360_to_camera`)::
 
        d = (-cos(b) sin(a), -sin(b), -cos(b) cos(a))
 
    ``a = b = 0`` looks straight at the camera ``(0, 0, -1)``; positive ``a``
-   points image-left (``-x``), positive ``b`` points image-up (``-y``). These
-   signs are DERIVED FROM THE REPOSITORIES' CODE (``draw_gaze`` and the
-   Gaze360 eye-frame convention), not checked on real footage yet.
-6. Optional perspective correction (``perspective_correction``, default off,
-   unverified): the model only sees the crop, so ``d`` is rotated by the
-   minimal rotation taking the optical axis to the camera ray through the
-   crop centre.
-7. Confidence = ``sqrt(c_a * c_b) * visibility`` in [0, 1], where
-   ``c = 1 - entropy(softmax) / log(90)`` per head and ``visibility`` is the
-   face keypoint confidence from the gate.
+   (yaw) points image-left (``-x``), positive ``b`` (pitch) points image-up
+   (``-y``). The signs are verified: the Gaze360 dataset README defines the
+   eye frame (+x image-left, +y up, +z away from the camera) and the labels
+   ``yaw = atan2(g.x, -g.z)``, ``pitch = asin(g.y)``; upstream MobileGaze
+   ``onnx_inference.py`` takes output 0 as yaw and output 1 as pitch and draws
+   ``dx = -sin(yaw) cos(pitch)``, ``dy = -sin(pitch)``; on the repository
+   clips (got/museum/video.mp4, 201 person-frames) the gaze x component
+   correlates +0.63 with the nose offset from the eye midpoint (89% sign
+   agreement).
+6. Perspective correction (``perspective_correction``, default ON): Gaze360-
+   trained models see only the face crop and predict gaze relative to the
+   camera -> eye ray, so ``d`` is expressed in the frame of the ray through
+   ``person.eyes_px`` (else the crop centre) with
+   :func:`vfoa.geometry.ray_aligned`. Without it the gaze-minus-head-pose
+   difference follows the person's image position with a slope of about -1;
+   with it the slope is about -0.1. The intrinsics come from
+   ``frame.intrinsics`` or the configured camera.
+7. Confidence = ``clip(sqrt(c_a * c_b) / confidence_ref, 0, 1) * visibility``
+   in [0, 1], where ``c = 1 - entropy(softmax) / log(90)`` per head and
+   ``visibility`` is the face keypoint confidence from the gate. The raw
+   certainty of a 4-degree-bin model sits in a narrow band (about 0.18-0.37,
+   median 0.24 on the repository clips), so ``confidence_ref`` (default 0.25)
+   maps a typical prediction to about 1; ``null`` or ``<= 0`` keeps the raw
+   value (which makes ``attention.fusion: confidence`` under-weight gaze).
 
 Weights are never committed. They resolve from ``gaze.l2cs.path``, else
 ``<weights_dir>/<file>`` (``models.weights_dir`` or env ``VFOA_WEIGHTS_DIR``),
@@ -50,9 +66,10 @@ else they are downloaded there when ``models.allow_download`` and
 ``gaze.l2cs.download`` are true. Otherwise :class:`BackendUnavailable` is
 raised (the fast profile then falls back to ``head_proxy``).
 
-Cost: MobileOne-S0 at 448 px takes about 40-65 ms per person on CPU, far over
-a real-time budget; use ``gaze.stride`` (or ``input_size: 224``, accuracy
-unknown) for real-time CPU runs.
+Cost: MobileOne-S0 at 448 px takes about 10-25 ms per face on the 8-vCPU
+test machine (CPU only), over a real-time budget with several persons; use
+``gaze.stride`` (or ``input_size: 224``, accuracy unknown) for real-time CPU
+runs.
 
 Licences: the MobileGaze and L2CS-Net code is MIT. The weights are trained on
 Gaze360, whose terms are research / non-commercial only; the weights are
@@ -77,6 +94,7 @@ import cv2
 import numpy as np
 
 from vfoa.backends.base import BackendUnavailable, GazeBackend, weights_dir
+from vfoa.geometry import gaze360_to_camera, unproject
 from vfoa.types import DirectionEstimate, Frame, Person
 
 __all__ = [
@@ -242,15 +260,22 @@ def decode_bins(logits: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def angles_to_direction(a_rad: Any, b_rad: Any) -> np.ndarray:
-    """``(N, 3)`` unit camera-frame directions ``(-cos b sin a, -sin b, -cos b cos a)``."""
+    """``(N, 3)`` unit camera-frame directions ``(-cos b sin a, -sin b, -cos b cos a)``.
+
+    Thin wrapper of :func:`vfoa.geometry.gaze360_to_camera` without the eye-ray
+    correction (``a`` = yaw, ``b`` = pitch, radians).
+    """
     a = np.asarray(a_rad, dtype=np.float64).reshape(-1)
     b = np.asarray(b_rad, dtype=np.float64).reshape(-1)
-    d = np.stack([-np.cos(b) * np.sin(a), -np.sin(b), -np.cos(b) * np.cos(a)], axis=1)
-    return d / np.linalg.norm(d, axis=1, keepdims=True)
+    return gaze360_to_camera(a, b)
 
 
 def head_ray_rotation(u: float, v: float, K: np.ndarray) -> np.ndarray:
-    """Minimal rotation (3x3 float64) taking the optical axis ``(0, 0, 1)`` to the ray through ``(u, v)``."""
+    """Minimal rotation (3x3 float64) taking the optical axis ``(0, 0, 1)`` to the ray through ``(u, v)``.
+
+    Not used by the backend any more (it uses :func:`vfoa.geometry.ray_aligned`,
+    which keeps the ray frame's x axis horizontal); kept as a helper.
+    """
     r = np.linalg.solve(np.asarray(K, dtype=np.float64), np.array([u, v, 1.0]))
     r /= np.linalg.norm(r)
     z = np.array([0.0, 0.0, 1.0])
@@ -362,7 +387,7 @@ class BinnedGaze360Backend(GazeBackend):
 
     Config ``gaze.l2cs``: ``model``, ``path``, ``url``, ``sha256``,
     ``download``, ``input_size``, ``kpt_thr``, ``crop_margin``,
-    ``perspective_correction``, ``providers``. ``session`` may be injected
+    ``perspective_correction``, ``confidence_ref``, ``providers``. ``session`` may be injected
     (an object with ``get_inputs``/``get_outputs``/``run``); then neither
     onnxruntime nor weights are needed.
     """
@@ -453,7 +478,7 @@ class BinnedGaze360Backend(GazeBackend):
         l2 = self.l2cs
         thr = float(l2.get("kpt_thr", 0.5))
         margin = float(l2.get("crop_margin", 1.1))
-        items: list[tuple[int, np.ndarray, float]] = []
+        items: list[tuple[Person, np.ndarray, float]] = []
         crops: list[np.ndarray] = []
         for p in persons:
             det = p.detection
@@ -465,29 +490,37 @@ class BinnedGaze360Backend(GazeBackend):
             if box is None:
                 self.stats["gated_out"] += 1
                 continue
-            items.append((int(p.track_id), box, vis))
+            items.append((p, box, vis))
             crops.append(crop_square(frame.image, box, self._size))
         if not items:
             return {}
         la, lb = self._run(preprocess(crops))
         deg_a, conf_a = decode_bins(la)
         deg_b, conf_b = decode_bins(lb)
-        dirs = angles_to_direction(np.radians(deg_a), np.radians(deg_b))
-        K = None
-        if l2.get("perspective_correction"):
+        rays = None
+        if l2.get("perspective_correction", True):
             from vfoa.backends.depth_simple import frame_intrinsics  # noqa: PLC0415
 
-            K = frame_intrinsics(self.cfg, frame).K  # frame.intrinsics first, rescaled to the image
+            intr = frame_intrinsics(self.cfg, frame)  # frame.intrinsics first, rescaled to the image
+            uv = np.empty((len(items), 2), dtype=np.float64)
+            for j, (p, box, _vis) in enumerate(items):
+                eyes = None if p.eyes_px is None else np.asarray(p.eyes_px, dtype=np.float64).reshape(-1)
+                if eyes is not None and eyes.shape == (2,) and np.isfinite(eyes).all():
+                    uv[j] = eyes
+                else:
+                    uv[j] = (0.5 * (box[0] + box[2]), 0.5 * (box[1] + box[3]))
+            rays = unproject(uv, 1.0, intr)
+        dirs = gaze360_to_camera(np.radians(deg_a), np.radians(deg_b), rays)
+        ref = l2.get("confidence_ref", 0.25)
+        use_ref = ref is not None and float(ref) > 0
         out: dict[int, DirectionEstimate] = {}
-        for j, (tid, box, vis) in enumerate(items):
-            d = dirs[j]
-            if K is not None:
-                u, v = 0.5 * (box[0] + box[2]), 0.5 * (box[1] + box[3])
-                d = head_ray_rotation(u, v, K) @ d
-                d = d / np.linalg.norm(d)
-            conf = float(np.clip(math.sqrt(conf_a[j] * conf_b[j]) * vis, 0.0, 1.0))
-            out[tid] = DirectionEstimate(
-                direction=d, confidence=conf,
+        for j, (p, box, vis) in enumerate(items):
+            raw = math.sqrt(conf_a[j] * conf_b[j])
+            if use_ref:
+                raw = min(raw / float(ref), 1.0)
+            conf = float(np.clip(raw * vis, 0.0, 1.0))
+            out[int(p.track_id)] = DirectionEstimate(
+                direction=dirs[j], confidence=conf,
                 euler_deg=np.array([deg_a[j], deg_b[j], 0.0]), frame_index=frame.index,
             )
         self.stats["estimated"] += len(out)

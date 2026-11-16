@@ -178,6 +178,9 @@ DEFAULTS: dict = {
         "relaxed_kpt_thr": 0.1,
         "fallback_confidence": 0.5,
         "max_reproj_frac": 0.15,
+        # fsanet: the model sees a head crop, so its angles are relative to the
+        # camera -> eye ray; rotate them into that ray's frame (needs frame.intrinsics).
+        "eye_frame_correction": True,
     },
     "gaze": {
         "backend": "none",  # gaze360|l2cs|head_proxy|synthetic|none (the fast profile: l2cs)
@@ -188,6 +191,8 @@ DEFAULTS: dict = {
         "window": "causal",  # causal|static
         "window_step": None,  # null -> max(int(fps // 8), 1)
         "uncertainty_thr": 3.0,
+        # gaze360: the gaze is relative to the camera -> eye ray (Gaze360 labels);
+        # rotate it into that ray's frame (geometry.ray_aligned; needs frame.intrinsics).
         "eye_frame_correction": True,
         "weights": "gaze360/gaze360_model.pth.tar",
         "batch_size": 16,
@@ -203,7 +208,11 @@ DEFAULTS: dict = {
             "input_size": 448,  # training size; a fixed-size model overrides it
             "kpt_thr": 0.5,  # gate: nose and at least one eye at or above this confidence
             "crop_margin": 1.1,
-            "perspective_correction": False,  # rotate by the camera ray through the face (unverified)
+            # the gaze is relative to the camera -> eye ray (eyes_px, else the crop centre);
+            # rotate it into that ray's frame (frame.intrinsics or the configured camera)
+            "perspective_correction": True,
+            # raw certainty sqrt(c_a*c_b) that maps to confidence 1.0; null or <= 0 = raw value
+            "confidence_ref": 0.25,
             "providers": None,  # null -> CUDA (if available and models.device != cpu), else CPU
         },
     },

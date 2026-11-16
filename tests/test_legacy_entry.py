@@ -106,6 +106,33 @@ def test_opengl_renderer_falls_back_to_cv2() -> None:
     assert arrow.max() > 0
 
 
+def test_opengl_renderer_axes_with_fake_gl(monkeypatch) -> None:
+    """Camera-frame vectors reach the shader in its OpenGL frame (x right, y up, z to the viewer)."""
+    import contextlib
+
+    uniforms: dict = {}
+    ns = types.SimpleNamespace()
+    for name in GazeFrameRenderer._GL_NAMES:
+        setattr(ns, name, (lambda *a, **k: None) if name.startswith("gl") else name)
+    ns.create_opengl_context = lambda size: None
+    ns.compileShader = lambda src, kind: src
+    ns.compileProgram = lambda *shaders: contextlib.nullcontext()
+    ns.glGetUniformLocation = lambda shader, name: name
+    ns.glUniform1f = lambda loc, value: uniforms.__setitem__(loc, value)
+    ns.glReadPixels = lambda x, y, w, h, fmt, typ: bytes(w * h * 3)
+    monkeypatch.setattr(GazeFrameRenderer, "_gl", lambda: ns)
+
+    r = GazeFrameRenderer.OpenGLVectorRenderer(W, H, 140)
+    assert r.compileShader() is True
+    out = r.renderArrow((0.5, 0.5), (1.0, 0.0, 0.0), 0.1)
+    assert out.shape == (H, W, 3) and out.dtype == np.uint8
+    assert uniforms["vdir_x"] > 0  # image right stays right
+    r.renderArrow((0.5, 0.5), (0.0, 1.0, 0.0), 0.1)
+    assert uniforms["vdir_y"] < 0  # camera +Y (down) is shader -y
+    r.renderArrow((0.5, 0.5), (0.0, 0.0, 1.0), 0.1)
+    assert uniforms["vdir_z"] < 0  # camera +Z (away from the viewer) is shader -z
+
+
 # ------------------------------------------------------------------ Reconstruction
 IDX = (0, 31, 62, 93)  # one frame per script phase
 

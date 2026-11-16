@@ -29,6 +29,7 @@ gaze:
 #   relaxed_kpt_thr: 0.1      # keypoints backend: weaker face keypoints still used for PnP
 #   fallback_confidence: 0.5
 #   max_reproj_frac: 0.15
+#   eye_frame_correction: true   # fsanet: align the head pose with the camera -> eye ray
 # gaze:
 #   backend: l2cs             # gaze360|l2cs|head_proxy|synthetic|none
 #   fallback: head_proxy      # used when l2cs is unavailable (no onnxruntime, no weights, offline)
@@ -41,7 +42,8 @@ gaze:
 #     input_size: 448         # training size; 224 is ~4x cheaper, accuracy unknown
 #     kpt_thr: 0.5            # face gate: nose and one eye at least this confident, else head pose is used
 #     crop_margin: 1.1
-#     perspective_correction: false   # unverified; keep off until checked on ground truth
+#     perspective_correction: true    # gaze is relative to the camera -> eye ray; rotate it into that ray's frame
+#     confidence_ref: 0.25    # raw bin certainty that maps to confidence 1.0 (null or <= 0: raw, ~0.2-0.37)
 #   # l2cs weights are trained on Gaze360: research / non-commercial use only; never commit them.
 # segmentation:
 #   stride: 10
