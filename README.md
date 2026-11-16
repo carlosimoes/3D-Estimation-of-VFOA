@@ -23,7 +23,8 @@ person is looking at** (Visual Focus of Attention, VFOA):
 
 1. **depth**: metric depth from stereo block matching, ground-truth depth (Sintel) or a constant;
 2. **persons**: person detection with head boxes and COCO-17 keypoints;
-3. **tracking**: persistent person ids (ByteTrack-style Hungarian matching);
+3. **tracking**: persistent person ids (ByteTrack-style Hungarian matching on body
+   boxes, with the head box as the fallback when a body box is missing);
 4. **headpose** and **gaze**: 3D head and gaze directions per person;
 5. **segmentation**: object and person segments;
 6. **scene**: metric 3D objects (segments + depth), the 3D eye position of each person, and the segment of the person themselves (which they cannot attend to);
@@ -49,7 +50,7 @@ Two implementations live in this repository:
 - **accurate**: thesis models + the improved algorithm (angular attention scoring,
   confidence fusion, depth occlusion, ByteTrack, Kalman and HMM smoothing).
 - **thesis**: thesis models + the thesis-faithful, bug-fixed algorithm (greedy IoU
-  tracking, static Gaze360 window, radius outlier filter, `wall` ignored, ray-cone
+  tracking on head boxes, static Gaze360 window, radius outlier filter, `wall` ignored, ray-cone
   attention with the 45-degree agreement fusion, no occlusion, no smoothing).
 - **synthetic**: a deterministic scripted scene with fake backends and known ground
   truth. It needs no model and is used by the tests and the benchmark.
@@ -166,9 +167,9 @@ the fast profile on the repository's Sintel clip. Every key read by the code is 
 | `camera` | `fx`, `fy`, `cx`, `cy` (null -> from `hfov_deg`), `hfov_deg`, `baseline_m` |
 | `depth` | `backend`, `stride`, `phase`, `scale` (stereo matching resolution), `num_disparities`, `block_size`, `wls`, `wls_lambda`, `wls_sigma`, `min_depth_m`, `max_depth_m`, `constant_depth_m`, `speckle_window`, `speckle_range` |
 | `persons` | `backend`, `stride`, `phase`, `score_thr`, `kpt_thr`, `model`, `imgsz`, `head_scale`, `match_keypoints`; OpenPose/DensePose paths, `densepose_thr`, `upper_body_only`, `match_min_inside`, `keep_headless` |
-| `tracking` | `type` (byte/greedy_iou), `box` (head/body), `iou_thr`, `max_age`, `high_thr`, `low_thr`, `motion`, `max_predict_frames` |
+| `tracking` | `type` (byte/greedy_iou), `box` (body/head; default body, thesis head; `tracking.box`; the other kind is the fallback), `iou_thr`, `max_age`, `high_thr`, `low_thr`, `motion`, `max_predict_frames` |
 | `headpose` | `backend`, `stride`, `phase`, `max_hold_frames`, FSA-Net `models`, `eye_frame_correction`; keypoints backend: `relaxed_kpt_thr`, `fallback_confidence`, `max_reproj_frac` |
-| `gaze` | `backend`, `fallback`, `stride` (fast: 2), `phase`, `max_hold_frames`; Gaze360: `window`, `window_step`, `uncertainty_thr`, `eye_frame_correction`, `weights`, `batch_size`; `proxy_confidence` (head_proxy); `l2cs.{model, path, url, sha256, download, input_size, kpt_thr, crop_margin, perspective_correction, confidence_ref, providers}` |
+| `gaze` | `backend`, `fallback`, `stride` (fast: 2), `phase`, `max_hold_frames`; Gaze360: `window`, `window_step`, `uncertainty_thr`, `eye_frame_correction`, `weights`, `batch_size`; `proxy_confidence` (head_proxy); `l2cs.{model, path, url, sha256, download, input_size, kpt_thr, crop_margin, perspective_correction, confidence_ref, full_conf_face_px, min_face_px, providers}` |
 | `segmentation` | `backend`, `stride`, `phase`, `async`, `score_thr`, `model`, `imgsz`, Panoptic FPN paths, `panoptic_thr` |
 | `scene` | `point_stride`, `max_points_per_object`, `min_points`, `outlier` (percentile/radius/none), `outlier_percentiles`, `outlier_nb_points`, `outlier_radius_m`, `outlier_radius_scale`, `ignore_labels`, `person_labels`, `self_min_overlap`, `self_aabb_margin_m`, `eye_patch_px`, `match_dist_m`, `object_max_age` |
 | `attention` | `method` (angular/rays), `sigma_gaze_deg`, `sigma_head_deg`, `fusion` (fixed/agreement/confidence), `w_gaze`, `w_head`, `agreement_deg`, `target` (surface/centroid), `occlusion` (depth/aabb/none), `occlusion_margin_m`, `occlusion_samples`, `min_target_distance_m`, `distance_full_m`, `distance_decay_m`, `min_score`, `rays.{n, half_angles_gaze_deg, half_angles_head_deg}` |
@@ -189,7 +190,8 @@ whenever persons runs; scene, smoothing and attention run on every frame.
 
 `gaze.backend: l2cs` (`vfoa/backends/fast/l2cs_gaze.py`) is an L2CS-style binned
 yaw/pitch gaze model run with ONNX Runtime. The default model is MobileGaze
-MobileOne-S0 at 448 px, on a square face crop gated on the nose plus one eye.
+MobileOne-S0 at 448 px, on a square face crop gated on the nose plus one eye and on
+the crop size (no estimate below `gaze.l2cs.min_face_px`, 12 px by default).
 
 - **Fallback.** The fast profile sets `gaze.fallback: head_proxy`: when onnxruntime or
   the weights are unavailable, the head direction is used as gaze. The switch is
@@ -223,15 +225,22 @@ MobileOne-S0 at 448 px, on a square face crop gated on the nose plus one eye.
   (about 0.18-0.37, median 0.24 on the repository clips), so it is rescaled:
   confidence = clip(raw / `gaze.l2cs.confidence_ref`, 0, 1) x face visibility, with
   `confidence_ref` 0.25 by default; null or <= 0 keeps the raw value (which makes
-  `attention.fusion: confidence` under-weight gaze).
+  `attention.fusion: confidence` under-weight gaze). The result is then multiplied by a
+  face-size factor clip(crop side / `gaze.l2cs.full_conf_face_px`, 0.25, 1), with the
+  crop side in frame pixels and `full_conf_face_px` 48 by default, mirroring the
+  keypoint head pose, whose confidence scales with clip(keypoint span / 40, 0.25, 1).
+  The raw certainty does not drop on small faces, so without the factor gaze took about
+  82% of the fusion weight on small faces instead of the configured 60% (museum.mp4,
+  median face crop 21 px; verification, 2026-11-16). Null or <= 0 disables the factor.
 - **Cost.** The released ONNX files have a static batch of 1 (one call per person). On
   the 8-vCPU test machine, when it was quiet, L2CS cost about 8-15 ms per gaze run on
   museum.mp4 (benchmark-docs, 2026-11-16), hence `gaze.stride: 2` in the fast
   profile. The session disables ONNX Runtime's intra-op spin-waiting so its threads
   do not compete with torch (see
   [docs/performance.md](docs/performance.md#cpu-threading)).
-- A person who does not pass the face gate (nose plus one eye, `gaze.l2cs.kpt_thr`) gets
-  no L2CS gaze; attention then uses the head direction alone when a head pose exists.
+- A person who does not pass the face gate (nose plus one eye, `gaze.l2cs.kpt_thr`), or
+  whose face crop side is below `gaze.l2cs.min_face_px` (12 px by default; null or <= 0
+  disables this gate; no model call is made for such a face), gets no L2CS gaze; attention then uses the head direction alone when a head pose exists.
   Seen from behind, the keypoint head pose of the fast profile has no estimate either
   (it needs the nose plus three more face keypoints), so that person is not scored.
 
@@ -372,6 +381,11 @@ Numbers marked "(verification, 2026-11-16)" come from the verification run of th
   the pose model's face keypoints. YOLO11n-pose sometimes reports them with high
   confidence for a head seen from behind (seen on museum.mp4, frame 20), so such a
   person can get a wrong gaze and head direction.
+- **The l2cs estimate depends on the face crop.** A 20-25% change of the crop size moves
+  the estimate by a median of 12-14 degrees on 80 large faces, and small crops are less
+  reliable (hence the size factor and the `min_face_px` gate). The crop convention was
+  not compared with the training crops of the released weights, and the pitch sign is
+  confirmed only on downward gazes (verification, 2026-11-16).
 - **Fallback naming.** After a gaze fallback (for example l2cs -> head_proxy) the
   written `config.yaml` still names the requested backend; the `backends` entry of
   `timing.json` names the backend that actually ran (and `gaze_fallback` counts the
@@ -409,8 +423,11 @@ available on the development machine).
 | #35 | Fast backends, multi-rate stages, real-time mode, asynchronous segmentation, benchmark |
 | #2, #7 (follow-up) | Gaze360 axes: the eye frame has +x to the image left, so the camera vector is (-g.x, -g.y, g.z) (a rotation; it was mirrored left-right); gaze360, l2cs and FSA-Net share one eye-ray correction (`geometry.ray_aligned`) |
 | #35, #32 (follow-up) | CPU torch thread cap: a quarter of the logical CPUs with `segmentation.async` (two torch pools), half otherwise; real-time mode on museum.mp4 went from 0.8-1.3 to 6.0-8.3 FPS in this update's runs (see [docs/performance.md](docs/performance.md#real-time-mode)) |
+| #23, #35, #18, #21 (follow-up) | Fast profile on small or fast-moving heads: `tracking.box` defaults to `body` (thesis: `head`), so a small head that moves more than a third of its width per frame keeps its id; museum.mp4 went from 258 to 47 person ids over 552 frames (52 to 9 on the first 120). L2CS confidence scales with the face crop size (`gaze.l2cs.full_conf_face_px`) and faces below `gaze.l2cs.min_face_px` get no estimate |
 | optional | #10 detectors see the original image, #11 replaced by the scene builder, #13 single device, no process pools, #18 ByteTrack-style tracking, #21 confidence-weighted fusion, #31 structured JSONL/CSV outputs with frame timestamps |
 
 Note: adding the reconciled config keys to `DEFAULTS` changes the stage-cache keys
 once, so caches written before this change are recomputed. The keys changed once
 more when the `models` section stopped being hashed; older caches are recomputed.
+The `tracking` default (`box`) and the `gaze.l2cs` keys changed again with the
+small-heads follow-up, so headpose and gaze caches are recomputed once.

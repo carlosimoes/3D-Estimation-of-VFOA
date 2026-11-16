@@ -9,6 +9,7 @@ persons:
   backend: openpose_densepose
 tracking:
   type: greedy_iou
+  box: head
   iou_thr: 0.5
   max_age: 0
 headpose:

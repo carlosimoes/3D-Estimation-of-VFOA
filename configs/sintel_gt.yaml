@@ -14,5 +14,10 @@ depth:
 #   baseline_m: 0.1
 # segmentation:
 #   stride: 10
+# tracking:
+#   box: body                 # head|body box for IoU matching, the other kind is the fallback
 # gaze:
 #   stride: 2                 # the fast-profile default; 1 = l2cs on every frame
+#   l2cs:
+#     full_conf_face_px: 48.0 # confidence *= clip(face crop side px / this, 0.25, 1) (null or <= 0: off)
+#     min_face_px: 12.0       # smaller face crops get no gaze estimate and no model call (null or <= 0: off)

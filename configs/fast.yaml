@@ -23,6 +23,8 @@ gaze:
 #   imgsz: 640
 #   stride: 1
 # tracking:
+#   box: body                 # head|body box for IoU matching (the other kind is the fallback); small fast
+#                             # heads lose their id on head boxes (thesis profile: head)
 #   motion: true              # constant-velocity box prediction (byte tracker)
 #   max_predict_frames: 5
 # headpose:
@@ -44,6 +46,8 @@ gaze:
 #     crop_margin: 1.1
 #     perspective_correction: true    # gaze is relative to the camera -> eye ray; rotate it into that ray's frame
 #     confidence_ref: 0.25    # raw bin certainty that maps to confidence 1.0 (null or <= 0: raw, ~0.2-0.37)
+#     full_conf_face_px: 48.0 # confidence *= clip(face crop side px / this, 0.25, 1) (null or <= 0: off)
+#     min_face_px: 12.0       # smaller face crops get no gaze estimate and no model call (null or <= 0: off)
 #   # l2cs weights are trained on Gaze360: research / non-commercial use only; never commit them.
 # segmentation:
 #   stride: 10

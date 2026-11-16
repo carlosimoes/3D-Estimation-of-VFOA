@@ -157,7 +157,7 @@ DEFAULTS: dict = {
     },
     "tracking": {
         "type": "byte",  # byte|greedy_iou
-        "box": "head",
+        "box": "body",  # head|body: box used for IoU matching (the other kind is the fallback)
         "iou_thr": 0.3,
         "max_age": 30,
         "high_thr": 0.5,
@@ -213,6 +213,10 @@ DEFAULTS: dict = {
             "perspective_correction": True,
             # raw certainty sqrt(c_a*c_b) that maps to confidence 1.0; null or <= 0 = raw value
             "confidence_ref": 0.25,
+            # confidence *= clip(face crop side px / this, 0.25, 1); null or <= 0 = no size factor
+            "full_conf_face_px": 48.0,
+            # face crop side px below this -> no estimate and no model call; null or <= 0 = no gate
+            "min_face_px": 12.0,
             "providers": None,  # null -> CUDA (if available and models.device != cpu), else CPU
         },
     },
@@ -337,7 +341,7 @@ _ACCURATE: dict = {
 }
 
 _THESIS_EXTRA: dict = {
-    "tracking": {"type": "greedy_iou", "iou_thr": 0.5, "max_age": 0},
+    "tracking": {"type": "greedy_iou", "box": "head", "iou_thr": 0.5, "max_age": 0},
     "gaze": {"window": "static"},
     "scene": {"outlier": "radius", "ignore_labels": ["wall"], "point_stride": 1},
     "attention": {"method": "rays", "fusion": "agreement", "occlusion": "none"},

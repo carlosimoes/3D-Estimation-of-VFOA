@@ -333,7 +333,7 @@ def test_confidence_range(make_config, tmp_path, rng):
     out = backend(make_config, tmp_path, FakeSession(uniform)).estimate(make_frame(), [make_person(1, 160, 120)])
     assert out[1].confidence == pytest.approx(0.0, abs=1e-9)
     out = backend(make_config, tmp_path, FakeSession(const_outputs(10, -10))).estimate(
-        make_frame(), [make_person(1, 160, 120, nose=0.9, l_eye=0.9, r_eye=0.4)])
+        make_frame(), [make_person(1, 160, 120, eye_dist=24, nose=0.9, l_eye=0.9, r_eye=0.4)])
     assert 0.5 < out[1].confidence <= 1.0
     assert out[1].confidence == pytest.approx(0.9)
     rand = lambda x: (rng.normal(0, 5, (len(x), 90)), rng.normal(0, 5, (len(x), 90)))  # noqa: E731
@@ -783,3 +783,66 @@ def test_real_mobileone_s0_sintel(make_config, tmp_path, sintel_sample):
         assert np.isfinite(e.direction).all()
         assert np.linalg.norm(e.direction) == pytest.approx(1.0, abs=1e-6)
         assert 0.0 <= e.confidence <= 1.0
+
+
+# ---------------------------------------------------------------------- face size gate and factor
+def sized_person(tid, side, cx=160, cy=120, **kw):
+    p = make_person(tid, cx, cy, eye_dist=side / (1.1 * 2.3), **kw)
+    box = face_crop_box(p.detection.keypoints, p.detection.head_box, 0.5, 1.1)
+    assert box[2] - box[0] == pytest.approx(side, rel=1e-5)
+    return p
+
+
+def _est(make_config, tmp_path, side, fn=None, **l2cs):
+    sess = FakeSession(fn or const_outputs(20.0, -12.0))
+    be = backend(make_config, tmp_path, sess, **l2cs)
+    out = be.estimate(make_frame(), [sized_person(1, side)])
+    return out.get(1), sess, be
+
+
+def test_size_factor_scales_confidence(make_config, tmp_path):
+    big = _est(make_config, tmp_path, 96)[0].confidence
+    assert big == pytest.approx(0.9)
+    assert _est(make_config, tmp_path, 60)[0].confidence == pytest.approx(0.9)
+    assert _est(make_config, tmp_path, 48)[0].confidence == pytest.approx(big, rel=1e-4)
+    assert _est(make_config, tmp_path, 24)[0].confidence == pytest.approx(0.5 * big, rel=1e-4)
+    assert _est(make_config, tmp_path, 36)[0].confidence == pytest.approx(0.75 * big, rel=1e-4)
+    assert _est(make_config, tmp_path, 6, min_face_px=None)[0].confidence == pytest.approx(0.25 * big)
+    assert _est(make_config, tmp_path, 24, full_conf_face_px=96.0)[0].confidence == pytest.approx(0.25 * big, rel=1e-4)
+    z = _logits_with_certainty(0.125)
+    fn = lambda x: (np.tile(z, (len(x), 1)), np.tile(z, (len(x), 1)))  # noqa: E731
+    assert _est(make_config, tmp_path, 24, fn=fn)[0].confidence == pytest.approx(0.5 * 0.9 * 0.5, abs=1e-4)
+
+
+def test_min_face_gate(make_config, tmp_path):
+    est, sess, be = _est(make_config, tmp_path, 10)
+    assert est is None and sess.fed == [] and be.stats == {"gated_out": 1, "estimated": 0, "runs": 0}
+    est, sess, be = _est(make_config, tmp_path, 13)
+    assert est.confidence == pytest.approx(0.9 * 13 / 48, rel=1e-4) and len(sess.fed) == 1
+    sess = FakeSession(const_outputs())
+    be = backend(make_config, tmp_path, sess)
+    out = be.estimate(make_frame(), [sized_person(1, 10, cx=80), sized_person(2, 60, cx=240)])
+    assert sorted(out) == [2] and len(sess.fed) == 1
+    assert be.stats == {"gated_out": 1, "estimated": 1, "runs": 1}
+    est, sess, be = _est(make_config, tmp_path, 10, min_face_px=20.0, full_conf_face_px=None)
+    assert est is None
+    est, sess, be = _est(make_config, tmp_path, 24, min_face_px=30)
+    assert est is None and be.stats["gated_out"] == 1
+
+
+@pytest.mark.parametrize("off", [None, 0, -1.0])
+def test_size_knobs_disabled(make_config, tmp_path, off):
+    for side in (6, 24, 96):
+        est, sess, be = _est(make_config, tmp_path, side, full_conf_face_px=off, min_face_px=off)
+        assert est.confidence == pytest.approx(0.9) and len(sess.fed) == 1 and be.stats["gated_out"] == 0
+
+
+def test_size_knobs_keep_directions(make_config, tmp_path):
+    want = angles_to_direction(np.radians(20.0), np.radians(-12.0))[0]
+    for side in (6, 24, 96):
+        on = _est(make_config, tmp_path, side, min_face_px=None)[0]
+        off = _est(make_config, tmp_path, side, full_conf_face_px=None, min_face_px=None)[0]
+        np.testing.assert_allclose(on.direction, off.direction, atol=1e-12)
+        np.testing.assert_allclose(on.euler_deg, off.euler_deg)
+        flat = _est(make_config, tmp_path, side, min_face_px=None, perspective_correction=False)[0]
+        np.testing.assert_allclose(flat.direction, want, atol=1e-9)

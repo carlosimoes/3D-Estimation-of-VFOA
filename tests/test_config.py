@@ -70,6 +70,8 @@ def test_profiles(profile):
         assert cfg.tracking.type == "greedy_iou"
         assert cfg.tracking.iou_thr == 0.5
         assert cfg.tracking.max_age == 0
+        assert cfg.tracking.box == "head"  # thesis-faithful; the other profiles track on body boxes
+        assert PROFILES["thesis"]["tracking"]["box"] == "head"
         assert cfg.gaze.window == "static"
         assert cfg.scene.outlier == "radius"
         assert cfg.scene.ignore_labels == ["wall"]
@@ -81,9 +83,9 @@ def test_profiles(profile):
         assert cfg.smoothing.target == "none"
         # untouched keys keep their defaults
         assert cfg.attention.sigma_gaze_deg == 10.0
-        assert cfg.tracking.box == "head"
     else:
         assert cfg.tracking.type == "byte"
+        assert cfg.tracking.box == "body"
         assert cfg.attention.method == "angular"
         assert cfg.smoothing.direction == "kalman"
 
@@ -189,6 +191,18 @@ def test_merge_order(tmp_path):
 def test_yaml_mirrors_profile(repo_root, profile):
     from_file = load_config(repo_root / "configs" / f"{profile}.yaml")
     assert from_file.to_dict() == load_config(profile=profile).to_dict()
+
+
+def test_tracking_box_and_l2cs_size_defaults(repo_root):
+    import yaml
+
+    for profile in ("fast", "accurate", "synthetic"):
+        assert load_config(profile=profile).tracking.box == "body", profile
+    assert load_config(profile="thesis").tracking.box == "head"
+    thesis = yaml.safe_load((repo_root / "configs" / "thesis.yaml").read_text(encoding="utf-8"))
+    assert thesis["tracking"]["box"] == "head"
+    l2 = DEFAULTS["gaze"]["l2cs"]
+    assert l2["full_conf_face_px"] == 48.0 and l2["min_face_px"] == 12.0
 
 
 def test_all_config_files_load(repo_root):

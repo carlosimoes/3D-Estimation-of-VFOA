@@ -18,7 +18,10 @@ Pipeline per frame (``estimate``):
 1. Gate: the nose and at least one eye keypoint must be confident
    (``gaze.l2cs.kpt_thr``). Persons that fail get no gaze estimate, so the
    attention stage falls back to head pose (after the pipeline's
-   ``gaze.max_hold_frames`` hold of the last estimate).
+   ``gaze.max_hold_frames`` hold of the last estimate). A face whose crop side
+   (step 2, in frame pixels) is below ``gaze.l2cs.min_face_px`` (default 12)
+   is gated out the same way, before any crop or model call; ``null`` or
+   ``<= 0`` disables this size gate.
 2. Square crop centred on the confident face keypoints, side
    ``crop_margin * max(keypoint extent, 2.3 * eye distance)``, limited by the
    head box; border replication outside the frame.
@@ -52,13 +55,22 @@ Pipeline per frame (``estimate``):
    difference follows the person's image position with a slope of about -1;
    with it the slope is about -0.1. The intrinsics come from
    ``frame.intrinsics`` or the configured camera.
-7. Confidence = ``clip(sqrt(c_a * c_b) / confidence_ref, 0, 1) * visibility``
-   in [0, 1], where ``c = 1 - entropy(softmax) / log(90)`` per head and
-   ``visibility`` is the face keypoint confidence from the gate. The raw
-   certainty of a 4-degree-bin model sits in a narrow band (about 0.18-0.37,
-   median 0.24 on the repository clips), so ``confidence_ref`` (default 0.25)
-   maps a typical prediction to about 1; ``null`` or ``<= 0`` keeps the raw
-   value (which makes ``attention.fusion: confidence`` under-weight gaze).
+7. Confidence = ``clip(sqrt(c_a * c_b) / confidence_ref, 0, 1) * visibility * size``
+   in [0, 1], where ``c = 1 - entropy(softmax) / log(90)`` per head,
+   ``visibility`` is the face keypoint confidence from the gate and
+   ``size = clip(side / full_conf_face_px, 0.25, 1)`` with ``side`` the crop
+   side in frame pixels (``full_conf_face_px`` default 48; ``null`` or
+   ``<= 0`` gives ``size = 1``). The raw certainty of a 4-degree-bin model
+   sits in a narrow band (about 0.18-0.37, median 0.24 on the repository
+   clips), so ``confidence_ref`` (default 0.25) maps a typical prediction to
+   about 1; ``null`` or ``<= 0`` keeps the raw value (which makes
+   ``attention.fusion: confidence`` under-weight gaze). The raw certainty
+   does not drop on small faces (it is slightly higher), although small crops
+   are less reliable (downscaled faces move the estimate by a median of
+   13-19 degrees at 16-24 px), so the size factor mirrors the keypoint head
+   pose, whose confidence scales with ``clip(span / 40, 0.25, 1)``; without
+   it gaze took about 82% of the fusion weight on small faces instead of the
+   configured 60%.
 
 Weights are never committed. They resolve from ``gaze.l2cs.path``, else
 ``<weights_dir>/<file>`` (``models.weights_dir`` or env ``VFOA_WEIGHTS_DIR``),
@@ -381,13 +393,25 @@ def _providers(cfg: Mapping[str, Any], ort: Any, configured: Any) -> list[str]:
     return ["CPUExecutionProvider"]
 
 
+def _positive(value: Any) -> Optional[float]:
+    """``float(value)`` when it is a finite number > 0, else ``None`` (null or <= 0 disables a knob)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v > 0 else None
+
+
 # --------------------------------------------------------------------- backend
 class BinnedGaze360Backend(GazeBackend):
     """L2CS-style binned gaze (MobileGaze / L2CS-Net weights) on ONNX Runtime.
 
     Config ``gaze.l2cs``: ``model``, ``path``, ``url``, ``sha256``,
     ``download``, ``input_size``, ``kpt_thr``, ``crop_margin``,
-    ``perspective_correction``, ``confidence_ref``, ``providers``. ``session`` may be injected
+    ``perspective_correction``, ``confidence_ref``, ``full_conf_face_px``,
+    ``min_face_px``, ``providers``. ``session`` may be injected
     (an object with ``get_inputs``/``get_outputs``/``run``); then neither
     onnxruntime nor weights are needed.
     """
@@ -478,6 +502,8 @@ class BinnedGaze360Backend(GazeBackend):
         l2 = self.l2cs
         thr = float(l2.get("kpt_thr", 0.5))
         margin = float(l2.get("crop_margin", 1.1))
+        full_px = _positive(l2.get("full_conf_face_px", 48.0))
+        min_px = _positive(l2.get("min_face_px", 12.0))
         items: list[tuple[Person, np.ndarray, float]] = []
         crops: list[np.ndarray] = []
         for p in persons:
@@ -487,7 +513,7 @@ class BinnedGaze360Backend(GazeBackend):
                 self.stats["gated_out"] += 1
                 continue
             box = face_crop_box(det.keypoints, det.head_box, thr, margin)
-            if box is None:
+            if box is None or (min_px is not None and float(box[2] - box[0]) < min_px):
                 self.stats["gated_out"] += 1
                 continue
             items.append((p, box, vis))
@@ -518,7 +544,8 @@ class BinnedGaze360Backend(GazeBackend):
             raw = math.sqrt(conf_a[j] * conf_b[j])
             if use_ref:
                 raw = min(raw / float(ref), 1.0)
-            conf = float(np.clip(raw * vis, 0.0, 1.0))
+            size = 1.0 if full_px is None else float(np.clip(float(box[2] - box[0]) / full_px, 0.25, 1.0))
+            conf = float(np.clip(raw * vis * size, 0.0, 1.0))
             out[int(p.track_id)] = DirectionEstimate(
                 direction=dirs[j], confidence=conf,
                 euler_deg=np.array([deg_a[j], deg_b[j], 0.0]), frame_index=frame.index,

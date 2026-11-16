@@ -172,3 +172,29 @@ def test_module_level_imports_are_light(name):
             continue
         for m in mods:
             assert m == "vfoa.types" or m.split(".")[0] in allowed, m
+
+
+def moving(f, head=True, body=True, step=20.0):
+    x = 100.0 + step * f
+    hb = [x + 25, 50, x + 55, 80] if head else None
+    bb = [x, 50, x + 80, 250] if body else None
+    return PersonDetection(head_box=hb, body_box=bb, score=0.9)
+
+
+def test_default_tracks_small_fast_head_on_body_box(make_config):
+    cfg = make_config("fast")
+    tr = PersonTracker(cfg)
+    assert tr.box_kind == "body" and PersonTracker().box_kind == "body"
+    assert [tr.update([moving(f)], f)[0].track_id for f in range(15)] == [0] * 15
+    tr = PersonTracker(cfg, box="head")
+    got = [tr.update([moving(f)], f)[0].track_id for f in range(15)]
+    assert len(set(got)) > 1
+    assert PersonTracker(make_config("thesis")).box_kind == "head"
+
+
+def test_head_only_detection_falls_back_to_head_box():
+    tr = PersonTracker()
+    got = [tr.update([moving(f, body=f not in (6, 7))], f)[0].track_id for f in range(15)]
+    assert got == [0] * 15
+    tr = PersonTracker()
+    assert [tr.update([det(10 + 2 * f, 10)], f)[0].track_id for f in range(8)] == [0] * 8
