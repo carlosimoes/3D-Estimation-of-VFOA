@@ -194,6 +194,9 @@ MobileOne-S0 at 448 px, on a square face crop gated on the nose plus one eye.
 - **Fallback.** The fast profile sets `gaze.fallback: head_proxy`: when onnxruntime or
   the weights are unavailable, the head direction is used as gaze. The switch is
   logged and counted (`gaze_fallback` in `timing.json`); the benchmark prints a NOTE.
+  A complete l2cs gaze cache is served without onnxruntime or the weights and with no
+  fallback (see
+  [Cache and re-scoring without models](#cache-and-re-scoring-without-models)).
 - **Weights download.** With `models.allow_download` and `gaze.l2cs.download` (both
   default true) `mobileone_s0_gaze.onnx` is downloaded from the MobileGaze GitHub
   release (`yakhyo/gaze-estimation`, tag `weights`) into `models.weights_dir` (or
@@ -236,9 +239,26 @@ MobileOne-S0 at 448 px, on a square face crop gated on the nose plus one eye.
 
 With `cache.enabled` every model stage (depth, persons, headpose, gaze,
 segmentation) stores its per-frame output under `<output.dir>/cache` (`.npz` chunks
-+ `meta.json`). Cache keys depend only on the input and the stage's own settings, so
-attention, smoothing and scene settings can be changed and re-scored from the cache
-without loading any model:
++ `meta.json`), or under `cache.dir`.
+
+- **What a key depends on.** The input fingerprint, the stage's own config section and
+  `camera`; headpose and gaze also on the persons key and `tracking`; gaze also on
+  `runtime.lookahead_frames` and `input.fps`. Keys do not depend on `models.*`
+  (device, weights dir, downloads, third-party root: where and how a model is
+  loaded), nor on the attention, smoothing, scene, output or cache settings, so these
+  can be changed and re-scored from the cache.
+- **No model for a complete cache.** A stage whose cache is complete is served without
+  importing or loading its model. This also holds for a stage with a fallback (l2cs
+  gaze with `gaze.fallback: head_proxy`): the configured backend is kept, no fallback
+  is applied and nothing is counted, so a re-score works on a machine without
+  onnxruntime or the weights.
+- **Missing frames.** A frame missing from the cache loads the configured backend; if
+  that backend is unavailable the run stops with an error (the pipeline never switches
+  backend in the middle of a cache).
+- **Weights are not hashed.** The contents of weight files are not part of the key:
+  delete the cache directory after replacing a weights file.
+
+Re-scoring example:
 
 ```bash
 python -m vfoa run --config configs/sintel_gt.yaml --output-dir outputs/sintel --set cache.enabled=true
@@ -337,9 +357,9 @@ Numbers marked "(verification, 2026-11-16)" come from the verification run of th
 - **The thesis ray method misses small objects.** `attention.method=rays` (the thesis
   profile) casts rays on rings at 11.3 and 21.8 degrees around the gaze (12.5 and 24.0
   around the head direction), with no centre ray, as in the thesis. An object that
-  subtends less than the inner ring and is looked at directly gets no hits: 0 of 240 targets on the synthetic scene
-  (verification, 2026-11-16). Use angular scoring (`attention.method: angular`, the
-  default of the other profiles).
+  subtends less than the inner ring and is looked at directly gets no hits: 0 of 240
+  targets on the synthetic scene (verification, 2026-11-16). Use angular scoring
+  (`attention.method: angular`, the default of the other profiles).
 - **The accurate backends were never run with the real thesis models** (detectron2,
   DensePose, OpenPose, Gaze360, FSA-Net are not on the development machine); they are
   tested with fakes only.
@@ -348,6 +368,10 @@ Numbers marked "(verification, 2026-11-16)" come from the verification run of th
 - **Head pose yaw.** The keypoint head pose seems to overestimate yaw compared with
   l2cs gaze (regression slope of l2cs yaw on head yaw 0.34-0.57 on the repository
   clips; verification, 2026-11-16). This is not validated against ground truth.
+- **Face keypoints of a head seen from behind.** The l2cs and keypoint face gates rely on
+  the pose model's face keypoints. YOLO11n-pose sometimes reports them with high
+  confidence for a head seen from behind (seen on museum.mp4, frame 20), so such a
+  person can get a wrong gaze and head direction.
 - **Fallback naming.** After a gaze fallback (for example l2cs -> head_proxy) the
   written `config.yaml` still names the requested backend; the `backends` entry of
   `timing.json` names the backend that actually ran (and `gaze_fallback` counts the
@@ -388,4 +412,5 @@ available on the development machine).
 | optional | #10 detectors see the original image, #11 replaced by the scene builder, #13 single device, no process pools, #18 ByteTrack-style tracking, #21 confidence-weighted fusion, #31 structured JSONL/CSV outputs with frame timestamps |
 
 Note: adding the reconciled config keys to `DEFAULTS` changes the stage-cache keys
-once, so caches written before this change are recomputed.
+once, so caches written before this change are recomputed. The keys changed once
+more when the `models` section stopped being hashed; older caches are recomputed.

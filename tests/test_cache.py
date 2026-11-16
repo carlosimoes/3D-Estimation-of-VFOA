@@ -19,6 +19,7 @@ from vfoa.cache import (
     cache_root,
     decode,
     encode,
+    is_complete,
     stage_key,
     stage_meta,
 )
@@ -197,7 +198,11 @@ def test_stage_key_sensitivity():
         assert changed([ov]) == {stage}, ov
     assert changed(["persons.score_thr=0.9"]) == {"persons", "headpose", "gaze"}
     assert changed(["tracking.iou_thr=0.9"]) == {"headpose", "gaze"}
-    assert changed(["models.device=cpu"]) == set(STAGES)
+    # models.* says where and how a model is loaded, not what it computes
+    for ov in ["models.device=cpu", "models.weights_dir=/elsewhere", "models.allow_download=false",
+               "models.third_party_root=/opt/tp"]:
+        assert load_config(profile="synthetic", overrides=[ov]).models != base.models, ov
+        assert changed([ov]) == set(), ov
     assert changed(["camera.hfov_deg=70"]) == set(STAGES)
     assert changed(["runtime.lookahead_frames=6"]) == {"gaze"}
     for ov in ["attention.sigma_gaze_deg=3", "attention.method=rays", "smoothing.direction=ema",
@@ -278,6 +283,30 @@ def test_read_mode_never_writes(tmp_path):
     r.flush()
     r.close()
     assert _snapshot(tmp_path / "x") == before
+
+
+def test_is_complete_is_read_only(tmp_path):
+    key = "k" * 16
+    missing = tmp_path / "missing"
+    assert not is_complete(missing, "gaze", key)
+    assert not missing.exists()
+
+    root = tmp_path / "c"
+    c = _fill(root, stage="gaze", close=False)
+    c.flush()
+    assert not is_complete(root, "gaze", key)
+    c.close()
+    before = _snapshot(root)
+    assert is_complete(root, "gaze", key)
+    assert not is_complete(root, "gaze", "j" * 16)
+    assert not is_complete(root, "headpose", key)
+    assert _snapshot(root) == before
+    assert sorted(p.name for p in root.iterdir()) == ["gaze-" + key]
+
+    next((root / ("gaze-" + key)).glob("frames_*.npz")).unlink()
+    assert not is_complete(root, "gaze", key)
+    with pytest.raises(ValueError):
+        is_complete(root, "attention", key)
 
 
 def test_constructor_never_writes(tmp_path):
