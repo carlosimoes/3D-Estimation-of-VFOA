@@ -1,11 +1,7 @@
 from __future__ import division
-try:
-    import accimage
-except ImportError:
-    accimage = None
-import collections
+from collections.abc import Iterable
 import cv2
-import thesis_final.functional as F
+import functional as F
 
 __all__ = ["ToTensor", "Normalize", "Resize"]
 
@@ -81,10 +77,10 @@ class Resize(object):
     """
 
     def __init__(self, size, interpolation=cv2.INTER_LINEAR):
-        # assert isinstance(size, int) or (isinstance(size, collections.Iterable) and len(size) == 2)
+        # assert isinstance(size, int) or (isinstance(size, Iterable) and len(size) == 2)
         if isinstance(size, int):
             self.size = (size,size)
-        elif isinstance(size, collections.Iterable) and len(size) == 2:
+        elif isinstance(size, Iterable) and len(size) == 2:
             if type(size) == list:
                 size = tuple(size)
             self.size = size

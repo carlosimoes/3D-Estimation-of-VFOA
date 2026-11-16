@@ -1,0 +1,10 @@
+# Core runtime dependencies of the vfoa package (geometry, attention, IO,
+# synthetic profile and the model-free parts of every profile).
+# Optional extras: requirements-fast.txt (fast profile: ultralytics, AGPL-3.0,
+# and onnxruntime), requirements-accurate.txt (thesis models), and
+# requirements-dev.txt (tests). Heavy packages are always imported lazily.
+numpy>=1.24
+scipy
+opencv-python-headless
+pyyaml
+pillow

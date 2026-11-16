@@ -1,0 +1,31 @@
+# Synthetic profile: a deterministic scripted scene served by fake backends
+# (no models, no weights). Used by tests and benchmarks.
+profile: synthetic
+
+input:
+  source: synthetic
+  path: synthetic
+depth:
+  backend: synthetic
+persons:
+  backend: synthetic
+headpose:
+  backend: synthetic
+gaze:
+  backend: synthetic
+segmentation:
+  backend: synthetic
+  stride: 5
+
+# Commented knobs:
+# synthetic:
+#   width: 640
+#   height: 360
+#   fps: 30.0
+#   n_frames: 120
+#   n_persons: 2
+#   n_objects: 4
+#   noise_deg: 0.0
+#   occluder: false
+#   sway_m: 0.05              # lateral sway amplitude of the persons (metres)
+#   cost_ms: {persons: 15.0, segmentation: 40.0}   # emulated model cost per call

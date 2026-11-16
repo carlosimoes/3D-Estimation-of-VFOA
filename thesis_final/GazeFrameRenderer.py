@@ -1,28 +1,123 @@
-from ctypes.util import find_library
-from lucid.misc.gl.glcontext import create_opengl_context
-from numpy import frombuffer, uint8, float32
-from OpenGL.GL import GL_VERTEX_SHADER, GL_COLOR_BUFFER_BIT, glEnableVertexAttribArray, GL_FLOAT, glUniform3f, \
-    GL_FRAGMENT_SHADER, glUniform1f, glDrawArrays, glGetUniformLocation, GL_RGB, glReadPixels, glClear, \
-    glVertexAttribPointer, GL_TRIANGLE_STRIP, GL_UNSIGNED_BYTE
-from OpenGL.GL.shaders import compileProgram, compileShader
+"""Gaze arrow rendering for the feature videos (legacy module).
 
+Two renderers are available:
+
+* :func:`draw_gaze_arrow` - a pure OpenCV 2D arrow (the default; needs no GPU,
+  no OpenGL and no display). It returns a NEW image and never draws in place.
+* :class:`OpenGLVectorRenderer` - the thesis ray-marched 3D arrow, rendered
+  with PyOpenGL in a ``lucid`` offscreen context. ``lucid``/``OpenGL`` are
+  imported lazily in :func:`_gl`; when they (or a GL context) are unavailable
+  ``compileShader()`` returns False and ``renderArrow`` falls back to
+  :func:`draw_gaze_arrow` on a black canvas.
+
+Directions are camera-frame vectors (OpenCV pinhole: +X right, +Y down, +Z
+forward); positions and lengths are pixels unless stated otherwise.
 """
-Renders a 3D vector using PyOpenGL interface, executes parsed C++ code.
-The method renderArrow returns an array of shape (outputWidth, outputHeight,3) containing a 3D arrow, given 3D position and vector components. 
-Before one or several calls of renderArrow, the method compileShader must be called.
-"""
+
+from __future__ import annotations
+
+import _bootstrap  # noqa: F401  (adds the repo root to sys.path)
+
+import logging
+import math
+import types
+from typing import Optional, Sequence
+
+import cv2
+import numpy as np
+from numpy import float32, frombuffer, uint8
+
+logger = logging.getLogger(__name__)
 
 VERTEX_POSITIONS = float32([[-1, -1], [1, -1], [-1, 1], [1, 1]])
 GL_EXTENSION = "#extension GL_ARB_explicit_attrib_location: enable"
 
+_GL_NAMES = (
+    "GL_VERTEX_SHADER", "GL_COLOR_BUFFER_BIT", "glEnableVertexAttribArray", "GL_FLOAT", "glUniform3f",
+    "GL_FRAGMENT_SHADER", "glUniform1f", "glDrawArrays", "glGetUniformLocation", "GL_RGB", "glReadPixels",
+    "glClear", "glVertexAttribPointer", "GL_TRIANGLE_STRIP", "GL_UNSIGNED_BYTE",
+)
+
+
+def _gl() -> types.SimpleNamespace:
+    """Import lucid/PyOpenGL lazily and return a namespace of the GL names used here.
+
+    Raises ImportError when ``lucid`` or ``PyOpenGL`` is not installed.
+    """
+    from lucid.misc.gl.glcontext import create_opengl_context  # noqa: PLC0415
+    import OpenGL.GL as GL  # noqa: PLC0415
+    from OpenGL.GL.shaders import compileProgram, compileShader  # noqa: PLC0415
+
+    ns = types.SimpleNamespace(
+        create_opengl_context=create_opengl_context,
+        compileProgram=compileProgram,
+        compileShader=compileShader,
+    )
+    for name in _GL_NAMES:
+        setattr(ns, name, getattr(GL, name))
+    return ns
+
+
+def draw_gaze_arrow(
+    image: np.ndarray,
+    origin_px: Sequence[float],
+    direction: Sequence[float],
+    length_px: float = 80.0,
+    color: tuple[int, int, int] = (0, 255, 255),
+    thickness: int = 2,
+) -> np.ndarray:
+    """Return a COPY of ``image`` with a 2D gaze arrow drawn on it.
+
+    ``origin_px`` is (u, v) in pixels; ``direction`` is a camera-frame 3D vector
+    (+X right, +Y down), normalised in 3D, so the arrow goes from the origin to
+    ``origin + length_px * d[:2]`` (a direction along the optical axis gives only
+    the origin dot). A filled radius-3 dot marks the origin. Non-finite or zero
+    inputs return a plain copy.
+    """
+    out = np.array(image, dtype=np.uint8, copy=True, order="C")
+    if out.ndim == 2:
+        out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
+    try:
+        o = np.asarray(origin_px, dtype=np.float64).reshape(-1)[:2]
+        d = np.asarray(direction, dtype=np.float64).reshape(-1)[:3]
+        length = float(length_px)
+    except (TypeError, ValueError):
+        return out
+    if o.size < 2 or d.size < 3:
+        return out
+    if not (np.isfinite(o).all() and np.isfinite(d).all() and math.isfinite(length)):
+        return out
+    n = float(np.linalg.norm(d))
+    if n <= 1e-12:
+        return out
+    d = d / n
+    lim = 10.0 * max(out.shape[0], out.shape[1], 1)
+    o = np.clip(o, -lim, lim)
+    end = np.clip(o + length * d[:2], -lim, lim)
+    p0 = (int(round(o[0])), int(round(o[1])))
+    p1 = (int(round(end[0])), int(round(end[1])))
+    col = tuple(int(c) for c in color)
+    if p1 != p0:
+        cv2.arrowedLine(out, p0, p1, col, int(thickness), cv2.LINE_AA, 0, 0.25)
+    cv2.circle(out, p0, 3, col, -1, cv2.LINE_AA)
+    return out
+
+
+"""
+Renders a 3D vector using PyOpenGL interface, executes parsed C++ code.
+The method renderArrow returns an array of shape (outputWidth, outputHeight,3) containing a 3D arrow, given 3D position and vector components.
+Before one or several calls of renderArrow, the method compileShader must be called.
+"""
+
+
 class OpenGLVectorRenderer:
-    def __init__(self, outputWidth: int, outputHeight: int, glVersion:int):
+    def __init__(self, outputWidth: int, outputHeight: int, glVersion: int = 140):
         """
         :param glVersion: must follow the pattern "#version {n}", with n an integer equal to your OpenGL shading language version (type glxinfo in terminal to get it) :
                         if 1.00, the argument mlust be "100;if 1.40, "140".
         """
 
-        self.width, self.height = outputWidth, outputHeight
+        self.width, self.height = int(outputWidth), int(outputHeight)
         self.glVersion = "#version "+str(glVersion)
         self.shader = None
         self.xpos = None
@@ -32,46 +127,71 @@ class OpenGLVectorRenderer:
         self.vdir_z = None
         self.arrow_size = None
         self.res_loc = None
+        self._gl: Optional[types.SimpleNamespace] = None
 
-
-    def compileShader(self):
+    def compileShader(self) -> bool:
         """
-        WARNING : Must be called before one or several renderArrow calls. 
-        Creates an OpenGL context, compiles C++ code written in compileVertexShader and compileFragmentShader, and sets attributes.
+        Creates an OpenGL context, compiles the shaders and sets the uniform locations.
+        Returns True on success, or False (with a warning) when lucid/OpenGL or a GL
+        context is unavailable; renderArrow then uses the cv2 fallback. Never raises.
         """
-        create_opengl_context((self.width, self.height))
-        glClear(GL_COLOR_BUFFER_BIT)
-        self.shader = compileProgram(self.compileVertexShader(), self.compileFragmentShader())
-        self.xpos = glGetUniformLocation(self.shader, 'xpos')
-        self.ypos = glGetUniformLocation(self.shader, 'ypos')
-        self.vdir_x = glGetUniformLocation(self.shader, 'vdir_x')
-        self.vdir_y = glGetUniformLocation(self.shader, 'vdir_y')
-        self.vdir_z = glGetUniformLocation(self.shader, 'vdir_z')
-        self.arrow_size = glGetUniformLocation(self.shader, 'size')
-        self.res_loc = glGetUniformLocation(self.shader, 'iResolution')
+        try:
+            gl = _gl()
+            gl.create_opengl_context((self.width, self.height))
+            gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+            self._gl = gl
+            self.shader = gl.compileProgram(self.compileVertexShader(), self.compileFragmentShader())
+            self.xpos = gl.glGetUniformLocation(self.shader, 'xpos')
+            self.ypos = gl.glGetUniformLocation(self.shader, 'ypos')
+            self.vdir_x = gl.glGetUniformLocation(self.shader, 'vdir_x')
+            self.vdir_y = gl.glGetUniformLocation(self.shader, 'vdir_y')
+            self.vdir_z = gl.glGetUniformLocation(self.shader, 'vdir_z')
+            self.arrow_size = gl.glGetUniformLocation(self.shader, 'size')
+            self.res_loc = gl.glGetUniformLocation(self.shader, 'iResolution')
+            return True
+        except Exception as exc:  # ImportError, GL context or shader errors
+            logger.warning("OpenGL arrow renderer unavailable (%s); using the cv2 arrow fallback", exc)
+            self._gl = None
+            self.shader = None
+            return False
 
-    
     def renderArrow(self, position, vector, asize):
         """
-        Returns a numpy array of dimensions (self.outputWidth, self.outputHeight) containing an arrow pointing from position, components in vector and length in asize.
+        Returns a (height, width, 3) uint8 image with an arrow starting at ``position``
+        (normalised image coordinates in [0, 1]^2) along the camera-frame ``vector``
+        (+X right, +Y down, +Z forward). ``asize`` is the arrow size (the cv2 fallback
+        draws an arrow of 2 * asize * width pixels).
         """
-        glClear(GL_COLOR_BUFFER_BIT)
+        gl = self._gl
+        if gl is None or self.shader is None:
+            canvas = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            try:
+                origin = (float(position[0]) * self.width, float(position[1]) * self.height)
+                length = 2.0 * float(asize) * self.width
+            except (TypeError, ValueError, IndexError):
+                return canvas
+            return draw_gaze_arrow(canvas, origin, vector, length)
+        # the shader frame is OpenGL's: x right, y up, z towards the viewer (eye at
+        # z = +20), so a camera-frame vector (x right, y down, z forward) becomes
+        # (x, -y, -z); the cv2 fallback draws the same arrow
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT)
         with self.shader:
-            glUniform1f(self.xpos, (2 * position[0] - 1) * 0.89)
-            glUniform1f(self.ypos, (-2 * position[1] + 1) * 0.67)
-            glUniform1f(self.vdir_x, -vector[0])
-            glUniform1f(self.vdir_y, vector[1])
-            glUniform1f(self.vdir_z, -vector[2])
-            glUniform1f(self.arrow_size, asize)
-            glUniform3f(self.res_loc, self.width, self.height, 1.0)
-            glEnableVertexAttribArray(0)
-            glVertexAttribPointer(0, 2, GL_FLOAT, False, 0, VERTEX_POSITIONS)
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
-        return frombuffer(glReadPixels(0, 0, self.width, self.height, GL_RGB, GL_UNSIGNED_BYTE), uint8).reshape(
-            self.height, self.width, 3)[::-1]
+            gl.glUniform1f(self.xpos, (2 * position[0] - 1) * 0.89)
+            gl.glUniform1f(self.ypos, (-2 * position[1] + 1) * 0.67)
+            gl.glUniform1f(self.vdir_x, float(vector[0]))
+            gl.glUniform1f(self.vdir_y, -float(vector[1]))
+            gl.glUniform1f(self.vdir_z, -float(vector[2]))
+            gl.glUniform1f(self.arrow_size, asize)
+            gl.glUniform3f(self.res_loc, self.width, self.height, 1.0)
+            gl.glEnableVertexAttribArray(0)
+            gl.glVertexAttribPointer(0, 2, gl.GL_FLOAT, False, 0, VERTEX_POSITIONS)
+            gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, 0, 4)
+        pixels = gl.glReadPixels(0, 0, self.width, self.height, gl.GL_RGB, gl.GL_UNSIGNED_BYTE)
+        return frombuffer(pixels, uint8).reshape(self.height, self.width, 3)[::-1].copy()
 
     def compileVertexShader(self):
-        return compileShader(self.glVersion + "\n" + GL_EXTENSION + "\n" + """
+        gl = self._gl if self._gl is not None else _gl()
+        return gl.compileShader(self.glVersion + "\n" + GL_EXTENSION + "\n" + """
                 layout(location = 0) in vec4 position;
                 out vec2 UV;
                 void main()
@@ -80,10 +200,11 @@ class OpenGLVectorRenderer:
                   gl_Position = position;
                 }
                 """
-                             , GL_VERTEX_SHADER)
+                             , gl.GL_VERTEX_SHADER)
 
     def compileFragmentShader(self):
-        return compileShader(self.glVersion + "\n" + GL_EXTENSION + "\n" + """
+        gl = self._gl if self._gl is not None else _gl()
+        return gl.compileShader(self.glVersion + "\n" + GL_EXTENSION + "\n" + """
                 out vec4 outputColor;
                 in vec2 UV;
                 
@@ -352,4 +473,4 @@ class OpenGLVectorRenderer:
                 }
                 
                 """,
-                             GL_FRAGMENT_SHADER)
+                             gl.GL_FRAGMENT_SHADER)

@@ -1,0 +1,45 @@
+# Accurate profile: the original thesis models (StereoBM depth, OpenPose + DensePose,
+# FSA-Net, Gaze360, Panoptic FPN) with the improved attention algorithm.
+# Needs the third-party checkouts: set models.third_party_root or VFOA_THIRD_PARTY.
+profile: accurate
+
+depth:
+  backend: stereo_bm
+persons:
+  backend: openpose_densepose
+headpose:
+  backend: fsanet
+gaze:
+  backend: gaze360
+segmentation:
+  backend: panoptic_fpn
+  stride: 1
+
+# Commented knobs:
+# models:
+#   third_party_root: /path/to/detectron2   # or env VFOA_THIRD_PARTY
+#   device: auto
+# input:
+#   right_path: null          # rectified right view for stereo_bm
+# depth:
+#   num_disparities: 160
+#   block_size: 15
+#   wls: auto                 # needs opencv-contrib (cv2.ximgproc)
+#   scale: 1.0                # matching resolution; 0.5 is ~4x cheaper
+#   speckle_window: 100       # 0 = off
+#   speckle_range: 2
+# headpose:
+#   eye_frame_correction: true   # FSA-Net angles are relative to the camera -> eye ray
+# gaze:
+#   eye_frame_correction: true   # Gaze360 gaze is relative to the camera -> eye ray
+# persons:
+#   upper_body_only: true     # zero the OpenPose knee/ankle keypoints
+#   match_min_inside: 0.5     # skeleton-to-DensePose-instance matching threshold
+#   keep_headless: false      # keep DensePose instances without a head box
+# segmentation:
+#   stride: 1
+#   async: false
+# tracking:
+#   box: body                 # head|body box for IoU matching, the other kind is the fallback (thesis profile: head)
+# runtime:
+#   lookahead_frames: 0       # >= 3 * gaze window_step for a centred Gaze360 window

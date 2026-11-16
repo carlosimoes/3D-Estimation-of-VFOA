@@ -1,0 +1,16 @@
+# "fast" real-time profile (YOLO11 pose / segmentation, L2CS-style gaze).
+# CPU-only machines can use the CPU torch wheels:
+#   pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-fast.txt
+-r requirements.txt
+torch
+# ultralytics is licensed AGPL-3.0. It is an OPTIONAL dependency: vfoa imports
+# it lazily, only inside vfoa/backends/fast/_ultra.py when a fast backend is
+# loaded. The rest of the package works without it.
+ultralytics>=8.3
+# onnxruntime runs the fast "l2cs" gaze backend (vfoa/backends/fast/l2cs_gaze.py),
+# imported lazily. Its weights (MobileGaze, https://github.com/yakhyo/gaze-estimation
+# release "weights", code MIT) are downloaded on first use into models.weights_dir
+# (or env VFOA_WEIGHTS_DIR) and are NEVER committed: they are trained on Gaze360,
+# whose terms allow research / non-commercial use only. Without onnxruntime or the
+# weights the fast profile falls back to gaze.backend=head_proxy.
+onnxruntime>=1.17

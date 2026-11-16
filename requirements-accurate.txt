@@ -1,0 +1,20 @@
+# "accurate" / "thesis" profiles: the original thesis models.
+-r requirements.txt
+torch
+torchvision
+onnxruntime
+open3d
+matplotlib
+
+# Notes:
+# - open3d is only used by the legacy thesis_final scripts and by the optional
+#   --micro benchmark (PLY round-trip); the vfoa pipeline does not need it.
+# - The WLS disparity filter (depth.wls) needs cv2.ximgproc, which only ships in
+#   opencv-contrib-python-headless. That wheel REPLACES opencv-python-headless
+#   (uninstall the latter first); without it the WLS step is skipped.
+# - detectron2 (+ projects/DensePose), Pose_Estimation (pytorch OpenPose),
+#   gaze360 and headpose-fsanet-pytorch are not installable from PyPI: they are
+#   source checkouts found through the config key models.third_party_root or
+#   the environment variable VFOA_THIRD_PARTY (thesis layout: a detectron2
+#   checkout that also holds projects/DensePose, Pose_Estimation, gaze360 and
+#   headpose-fsanet-pytorch). Relative weight paths resolve against that root.

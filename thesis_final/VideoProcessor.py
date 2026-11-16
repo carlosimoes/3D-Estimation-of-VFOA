@@ -1,797 +1,447 @@
-import cv2 
-import os, ffmpeg
-from numpy import reshape, concatenate, asarray, uint8, zeros, float16
-import numpy as np
-from random import randint as randomInt
-from time import time as timeSeconds
-from sys import maxsize, path
-from torch.cuda import empty_cache 
-from math import cos, sin
-from matplotlib import pyplot as plt
+"""Legacy video processing entry point, a thin wrapper over :class:`vfoa.pipeline.Pipeline`.
 
+The thesis ``VideoProcessor`` read the whole video into RAM, split it into
+batches (with a broken multi-batch path), reloaded every model per call and
+encoded the output videos with ffmpeg. It now streams the input frame by frame
+through the vfoa pipeline (models loaded once, ids consistent over the whole
+video) and writes, incrementally, into ``<output.dir>/<video stem>/``:
+
+* ``results.jsonl`` / ``results.csv``  structured per-frame outputs (``t = frame / fps`` seconds),
+* ``gazes.mp4``, ``keypoints.mp4``, ``headpose.mp4``, ``overlay.mp4``, ``mosaic.mp4``
+  feature videos (``writeVideo``; OpenCV ``mp4v``, no ffmpeg),
+* ``timing.json`` (per-stage timing summary), ``config.yaml`` (resolved config) and
+  ``features.desc`` (Width, Height, NumberFrames, FrameRate).
+
+The source frames are never modified: every drawing helper returns a new image.
+"""
+
+from __future__ import annotations
+
+import _bootstrap  # noqa: F401  (adds the repo root to sys.path)
+
+import copy
+import dataclasses
 import json
+import logging
+import sys
+from pathlib import Path
+from typing import Any, Mapping, Optional, Sequence
 
-from DensePosePredictor import DensePosePredictor
-from Data import MapFramesOutputs
-from GazeFrameRenderer import OpenGLVectorRenderer
-from GazePredictor1 import GazePredictor
-from HeadPredictor import HeadPredictor
-from OpenPosePredictor import OpenPosePredictor
-from BoxTracker import Tracker, TrackerMatcher
-from PanopticPrediction import PanopticPredictor
-from Reconstruction_scene import Reconstruction
+import cv2
+import numpy as np
+import yaml
+
+from GazeFrameRenderer import draw_gaze_arrow
+from Reconstruction_scene import depth_from_disparity, q_for_frame
+from vfoa.backends.base import DepthBackend
+from vfoa.backends.depth_simple import frame_intrinsics
+from vfoa.config import Config, dump_config, load_config
+from vfoa.io.outputs import CsvSink, JsonlSink, VideoSink, compose_mosaic, draw_head_axes, draw_overlay
+from vfoa.pipeline import Pipeline, open_input
+from vfoa.types import DepthFrame, Frame, FrameResult
+
+__all__ = [
+    "VideoProcessor",
+    "PrecomputedDepth",
+    "FeatureVideoSink",
+    "config_from_legacy_args",
+    "draw_keypoints",
+    "draw_gazes",
+    "draw_headpose",
+    "COCO_LIMBS",
+]
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_PROFILE = "thesis"
+
+#: COCO-17 skeleton (pairs of keypoint indices).
+COCO_LIMBS: tuple[tuple[int, int], ...] = (
+    (0, 1), (0, 2), (1, 3), (2, 4), (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+    (5, 11), (6, 12), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
+)
+_LIMB_COLORS: tuple[tuple[int, int, int], ...] = tuple(
+    tuple(int(c) for c in cv2.cvtColor(np.uint8([[[int(180 * k / len(COCO_LIMBS)), 255, 255]]]),
+                                       cv2.COLOR_HSV2BGR)[0, 0])
+    for k in range(len(COCO_LIMBS))
+)
+
+#: legacy flag -> config key path ("section.key" or "section.key[index]").
+LEGACY_FLAGS: tuple[tuple[str, str], ...] = (
+    ("cfg", "persons.openpose_cfg"),
+    ("opM", "persons.openpose_weights"),
+    ("dpCfg", "persons.densepose_cfg"),
+    ("dpM", "persons.densepose_weights"),
+    ("dpT", "persons.densepose_thr"),
+    ("PpCfg", "segmentation.panoptic_cfg"),
+    ("PpM", "segmentation.panoptic_weights"),
+    ("PpT", "segmentation.panoptic_thr"),
+    ("gM", "gaze.weights"),
+    ("gB", "gaze.batch_size"),
+    ("gT", "gaze.uncertainty_thr"),
+    ("od", "output.dir"),
+    ("max_frames", "input.max_frames"),
+)
 
 
+# ------------------------------------------------------------------ config
+def _profile_of_file(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    with open(path, "r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    if isinstance(data, Mapping) and data.get("profile"):
+        return str(data["profile"])
+    return None
 
-path.append("/home/carlos/Thesis_GOD/detectron2/Pose_Estimation")
-from lib.utils.common import draw_humans
-path.append("/home/carlos/Thesis_GOD/detectron2")
-from detectron2.utils.visualizer import Visualizer
+
+def config_from_legacy_args(args: Any) -> Config:
+    """Resolved :class:`Config` of legacy ``FinalTest`` arguments (or a config mapping).
+
+    A :class:`Config` is deep-copied; another mapping is merged over its
+    ``profile`` (default ``thesis``). For an argparse namespace (every attribute
+    optional) the profile is ``args.profile``, else the ``profile`` key of
+    ``args.config``, else ``thesis``; ``args.set`` are ``a.b=c`` overrides; then
+    every non-None legacy flag (``cfg, opM, dpCfg, dpM, dpT, PpCfg, PpM, PpT, gM,
+    gB, gT, hM1, hM2, od, max_frames, dev``) is written into its config key.
+    """
+    if isinstance(args, Config):
+        return copy.deepcopy(args)
+    if isinstance(args, Mapping):
+        data = dict(args)
+        profile = data.pop("profile", None) or DEFAULT_PROFILE
+        return load_config(profile=profile, overrides=data or None)
+    config_path = getattr(args, "config", None)
+    profile = getattr(args, "profile", None) or _profile_of_file(config_path) or DEFAULT_PROFILE
+    sets = list(getattr(args, "set", None) or [])
+    cfg = load_config(config_path, profile, overrides=sets or None)
+    for flag, key in LEGACY_FLAGS:
+        value = getattr(args, flag, None)
+        if value is None:
+            continue
+        section, name = key.split(".")
+        cfg[section][name] = value
+    models = list(cfg.headpose.get("models") or [])
+    for i, flag in enumerate(("hM1", "hM2")):
+        value = getattr(args, flag, None)
+        if value is not None:
+            while len(models) <= i:
+                models.append(None)
+            models[i] = value
+    cfg.headpose.models = models
+    dev = getattr(args, "dev", None)
+    if isinstance(dev, str) and (dev == "cpu" or dev.startswith("cuda")):
+        cfg.models.device = dev
+    return cfg
 
 
-"""
-Extracts information from videos about humans : body keypoints, body pose estimation and gaze estimation ; and serializes it or add it to input frames to produce a video
-. Contains a GazeFrameRenderer to visualize the gaze arrow, and predictors. Intermediary and final results are stored in a MapFramesOutputs object, a dictionary mapping each frame to its extracted features.
-"""
+# ------------------------------------------------------------------ depth
+class PrecomputedDepth(DepthBackend):
+    """Depth served from legacy precomputed disparities (``Depth_Estimator`` output).
 
-class VideoProcessor:
-    def __init__(self, args, matrix_Q, disp,w=960, h=720):
-        """
-        :param args: an object with attributes for models configuration and output path.
-        :param w:  width of the generated output video(s)
-        :param h: height of the generated output video(s)
-        Attributes:
-        - gazeRenderer : an object that draws a 3D arrow on a blank image from a 3D vector.
-        - boxesRandomColors : for coloring the borders of the predicted boxes, on generated images.
-        - currentFrames: list of frames, last read
-        - inputW, inputH: current video frames dimensions
-        - outputW,outputH: dimensions of the output video(s)
-        - mapFramesOutputs: results map
-        """
-        self.gazeRenderer = None
-        self.config = args
-        self.boxesRandomColors = [[randomInt(0, 254), randomInt(0, 254), randomInt(0, 254)] for i in range(1000)]
-        self.currentFrames = None
-        self.inputW = self.inputH = 0
-        self.outputWidth = w
-        self.outputHeight = h
-        self.mapFramesOutputs = None
-        self.tracker=None
-        self.metadata=None
+    ``disp[k]`` (pixels, or a :class:`DepthFrame`) belongs to frame
+    ``input.start + k``; ``matrix_Q`` is one 4x4 Q matrix or one per frame.
+    Depth is ``Z = fx * B / d`` metres; frames outside the list get an
+    all-invalid depth.
+    """
+
+    name = "precomputed"
+
+    def __init__(self, cfg: Mapping[str, Any], matrix_Q: Any = None, disp: Optional[Sequence[Any]] = None) -> None:
+        super().__init__(cfg)
         self.matrix_Q = matrix_Q
-        self.disp=disp
-        self.directory=None
+        self.disp = disp if disp is not None else []
+        self.calls = 0
 
-    def generateVideosWithFeatures(self, filePath: str, outputPath: str, indexBegin: int = 0,
-                                   numberFrames: int = maxsize) -> None:
-        """
-        For test purposes on small videos : depends on the available RAM, processing 10000 frames requires 30 GB.
-        :param filePath:
-        :param outputPath:
-        :param indexBegin:
-        :param numberFrames:
-        :return:
-        """
-        fps = self.readFrames(filePath, indexBegin, numberFrames)
-        self.mapFramesOutputs = self.extractFeaturesFromCurrentVideo(fps)
-        self.writeOutputsToFiles(self.mapFramesOutputs, "test.timestamp", fps)
-        videoGazes = cv2.VideoWriter(outputPath + "-gazes.mp4", cv2.VideoWriter_fourcc(*'mp4v'), round(fps),
-                                 (self.outputWidth, self.outputHeight))
-        videoKeypoints = cv2.VideoWriter(outputPath + "-keypoints.mp4", cv2.VideoWriter_fourcc(*'mp4v'), round(fps),
-                                     (self.outputWidth, self.outputHeight))
-        self.gazeRenderer = OpenGLVectorRenderer(self.outputWidth, self.outputHeight, 140)
-        self.gazeRenderer.compileShader()
-        step = len(self.currentFrames) / 10
-        for i in range(len(self.currentFrames)):
-            if (i % step) == 0:
-                print(i, "frames added to videos with features")
-            imageGazes = zeros((self.outputHeight, self.outputWidth, 3), uint8)
-            imagePoints = zeros((self.outputHeight, self.outputWidth, 3), uint8)
-            if i in self.mapFramesOutputs.map:
-                pointsList = []
-                for id_t in self.mapFramesOutputs.getFrame(i).keys():
-                    points = self.mapFramesOutputs.getKeypoints(i, id_t)
-                    if points is not None:
-                        pointsList.append(points)
-                    bbox = self.mapFramesOutputs.getHeadBox(i, id_t)
-                    if bbox is not None:
-                        gaze = self.mapFramesOutputs.getGaze(i, id_t)
-                        if gaze is not None:
-                            imageGazes = self.getFullImage(imageGazes, bbox, gaze)
-                if len(pointsList) > 0:
-                    imagePoints = draw_humans(imagePoints, pointsList)
-            videoKeypoints.write(imagePoints.astype(uint8))
-            videoGazes.write(imageGazes.astype(uint8))
-        videoGazes.release()
-        videoKeypoints.release()
+    def compute(self, frame: Frame) -> DepthFrame:
+        self.calls += 1
+        start = int((self.cfg.get("input") or {}).get("start") or 0)
+        k = int(frame.index) - start
+        h, w = frame.image.shape[:2]
+        if 0 <= k < len(self.disp):
+            df = depth_from_disparity(self.disp[k], q_for_frame(self.matrix_Q, k))
+            if df.depth.shape[:2] == (h, w):
+                return df
+            sx, sy = w / df.depth.shape[1], h / df.depth.shape[0]
+            depth = cv2.resize(df.depth, (w, h), interpolation=cv2.INTER_NEAREST)
+            valid = cv2.resize(df.valid.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
+            intr = df.intrinsics.scaled(sx, sy)
+            intr = dataclasses.replace(intr, width=w, height=h)
+            return DepthFrame(depth=depth.astype(np.float32), valid=valid, intrinsics=intr)
+        return DepthFrame(
+            depth=np.zeros((h, w), np.float32), valid=np.zeros((h, w), bool),
+            intrinsics=frame_intrinsics(self.cfg, frame),
+        )
 
-    def processVideo(self, filePath, imagesBatchLength=10000, extractGaze=True, writeVideo=True,matchPointsBox=False):
-        """
-        Reads a video, passes the frames into models of pose and gaze estimation, write files mapping the frames to the model otputs,
-        and writes videos with the model outputs. A mosaic video is finally produced, that contains the original video, and the outputs videos.
-        If the original video contains more frames than the value of the parameter imagesBatchLength, this processing is performed in a loop.
-        :param filePath: path of the video file.
-        :param imagesBatchLength: number of frames to be read and processed in one iteration of the processing loop.
-        :param extractGaze: if True, extract head boxes and estimate gaze.
-        :param writeVideo: if True, write video(s) of the extracted features, and a final mosaic video.
-        :param matchPointsBox:
-        :return:
-        """
-        #! INIT
-        detections = MapFramesOutputs()
-        cap = cv2.VideoCapture(filePath)
-        nFramesVideo = int(round(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        self.inputW, self.inputH = float(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),float(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if matchPointsBox:
-            self.tracker=TrackerMatcher()
+
+# ------------------------------------------------------------------ drawing
+def _scale(size: Sequence[int], src_size: Optional[Sequence[int]]) -> tuple[float, float]:
+    if not src_size or not src_size[0] or not src_size[1]:
+        return 1.0, 1.0
+    return float(size[0]) / float(src_size[0]), float(size[1]) / float(src_size[1])
+
+
+def draw_keypoints(result: FrameResult, size: Sequence[int], src_size: Optional[Sequence[int]] = None) -> np.ndarray:
+    """New black (h, w, 3) image (``size`` = (w, h)) with the COCO-17 skeletons of ``result``.
+
+    Keypoints (pixels of an image of ``src_size`` = (w, h)) are rescaled; only
+    joints with confidence > 0 are drawn.
+    """
+    w, h = int(size[0]), int(size[1])
+    out = np.zeros((h, w, 3), np.uint8)
+    sx, sy = _scale(size, src_size)
+    for person in result.persons:
+        det = person.detection
+        kp = None if det is None else det.keypoints
+        if kp is None:
+            continue
+        kp = np.asarray(kp, dtype=np.float64)
+        if kp.shape != (17, 3):
+            continue
+        ok = (kp[:, 2] > 0) & np.isfinite(kp).all(axis=1)
+        pts = np.round(kp[:, :2] * (sx, sy)).astype(np.int64)
+        for (a, b), color in zip(COCO_LIMBS, _LIMB_COLORS):
+            if ok[a] and ok[b]:
+                cv2.line(out, (int(pts[a, 0]), int(pts[a, 1])), (int(pts[b, 0]), int(pts[b, 1])), color, 2,
+                         cv2.LINE_AA)
+        for j in np.flatnonzero(ok):
+            cv2.circle(out, (int(pts[j, 0]), int(pts[j, 1])), 3, (255, 255, 255), -1, cv2.LINE_AA)
+    return out
+
+
+def _eye_px(person: Any) -> Optional[np.ndarray]:
+    if person.eyes_px is not None:
+        e = np.asarray(person.eyes_px, dtype=np.float64).reshape(-1)
+        if e.shape == (2,) and np.isfinite(e).all():
+            return e
+    det = person.detection
+    box = None if det is None else det.head_box
+    if box is None:
+        return None
+    b = np.asarray(box, dtype=np.float64).reshape(-1)
+    if b.shape != (4,) or not np.isfinite(b).all():
+        return None
+    return np.array([(b[0] + b[2]) / 2.0, 0.65 * b[1] + 0.35 * b[3]])
+
+
+def draw_gazes(result: FrameResult, size: Sequence[int], src_size: Optional[Sequence[int]] = None,
+               length: float = 0.1) -> np.ndarray:
+    """New black (h, w, 3) image with one gaze arrow per person (origin = eye pixel).
+
+    ``length`` is the arrow length as a fraction of the output width.
+    """
+    w, h = int(size[0]), int(size[1])
+    out = np.zeros((h, w, 3), np.uint8)
+    sx, sy = _scale(size, src_size)
+    for person in result.persons:
+        if person.gaze is None:
+            continue
+        eye = _eye_px(person)
+        if eye is None:
+            continue
+        out = draw_gaze_arrow(out, (eye[0] * sx, eye[1] * sy), person.gaze.direction, length * w)
+    return out
+
+
+def draw_headpose(image: np.ndarray, result: FrameResult) -> np.ndarray:
+    """COPY of ``image`` with the head pose of every person (FSA-Net axes, or an arrow)."""
+    out = np.array(image, dtype=np.uint8, copy=True)
+    for person in result.persons:
+        if person.head is None:
+            continue
+        eye = _eye_px(person)
+        if eye is None:
+            continue
+        eul = person.head.euler_deg
+        if eul is not None and np.isfinite(np.asarray(eul, dtype=np.float64)).all():
+            e = np.asarray(eul, dtype=np.float64).reshape(-1)
+            out = draw_head_axes(out, e[0], e[1], e[2], origin=eye, size=50.0)
         else:
-            self.tracker=Tracker()
-        self.tracker.setDim(self.inputW, self.inputH)
-        type=str(cap.read()[1].dtype)
-        cap.release()
-        dir = self.config.od + filePath[filePath.rfind('/'):filePath.rfind('.')] + "/"
-        self.directory=dir
-        if nFramesVideo <= imagesBatchLength:
-            print("process one run,", nFramesVideo, "frames")
-            self.readFrames(filePath,numberFrames=nFramesVideo)
-            if extractGaze:
-                print("processing with gaze estimation")
-                if matchPointsBox:
-                    detections, panoptic = self.extractFeaturesFromCurrentVideo(fps, matchPointsBox)
-                    self.writeTrackedOutputsToFilesSep(detections, dir, fps)
-                else:
-                    keypoints, detections, panoptic = self.extractFeaturesFromCurrentVideo(fps, matchPointsBox)
-                    self.writeOutputsToFilesSep(keypoints,detections,dir,fps)
-            else:
-                print("Keypoints estimation")
-                keypointsPredictor = OpenPosePredictor(self.config)
-                detections = keypointsPredictor(self.currentFrames)
-                del keypointsPredictor.model, keypointsPredictor
-                empty_cache()
-                self.writeKeypointsToFile(detections, dir, fps)
+            out = draw_gaze_arrow(out, eye, person.head.direction, 50.0, color=(255, 255, 255))
+    return out
+
+
+class FeatureVideoSink:
+    """Streams the five feature videos of the legacy pipeline (sink protocol).
+
+    ``gazes.mp4`` and ``keypoints.mp4`` are drawn on black ``size`` = (w, h)
+    canvases, ``headpose.mp4`` and ``overlay.mp4`` on copies of the frame, and
+    ``mosaic.mp4`` = 2x2 [frame, headpose, gazes, keypoints] at (2w, 2h).
+    """
+
+    NAMES = ("gazes", "keypoints", "headpose", "overlay", "mosaic")
+
+    def __init__(self, out_dir: Any, fps: float, size: Sequence[int] = (960, 720)) -> None:
+        self.out_dir = Path(out_dir)
+        self.size = (int(size[0]), int(size[1]))
+        w, h = self.size
+        self.sinks = {
+            "gazes": VideoSink(self.out_dir / "gazes.mp4", fps, self.size, overlay=False),
+            "keypoints": VideoSink(self.out_dir / "keypoints.mp4", fps, self.size, overlay=False),
+            "headpose": VideoSink(self.out_dir / "headpose.mp4", fps, None, overlay=False),
+            "overlay": VideoSink(self.out_dir / "overlay.mp4", fps, None, overlay=False),
+            "mosaic": VideoSink(self.out_dir / "mosaic.mp4", fps, (2 * w, 2 * h), overlay=False),
+        }
+        self._src_size: Optional[tuple[int, int]] = None
+
+    def write(self, frame: Optional[Frame], result: FrameResult) -> None:
+        if frame is not None:
+            image = frame.image
+            self._src_size = (int(image.shape[1]), int(image.shape[0]))
         else:
-            print("process",nFramesVideo,"frames", int(round(nFramesVideo / imagesBatchLength)), "runs")
-            iter = 0
-            if extractGaze:
-                print("whole processing, with gaze estimation")
-                if matchPointsBox:
-                    for indexFrame in range(0, nFramesVideo, imagesBatchLength):
-                        print("\nRun",iter+1)
-                        self.readFrames(filePath, indexFrame, imagesBatchLength)
-                        print(indexFrame)
-                        currentDetections = self.extractFeaturesFromCurrentVideo(fps,matchPointsBox)
-                        detections.appendMap(currentDetections)
-                        #self.writeTempFile(dir,fps,iter,detections=currentDetections)
-                        iter+=1
-                        self.currentFrames=None
-                        print("\n")
-                    self.writeTrackedOutputsToFilesSep(detections, dir, fps)
-                else:
-                    keypoints = []
-                    for indexFrame in range(0, nFramesVideo, imagesBatchLength):
-                        print("\nRun", iter + 1)
-                        self.readFrames(filePath, indexFrame, imagesBatchLength)
-                        points, boxesGazes = self.extractFeaturesFromCurrentVideo(fps, matchPointsBox)
-                        keypoints.extend(points)
-                        detections.appendMap(boxesGazes)
-                        #self.writeTempFile(dir,fps,iter,points=points,boxesGazes=boxesGazes)
-                        iter += 1
-                        self.currentFrames = None
-                        print("\n")
-                    self.writeOutputsToFilesSep(keypoints,detections, dir, fps)
-            else:
-                print("Keypoints estimation")
-                keypointsPredictor = OpenPosePredictor(self.config)
-                keypointsPredictor.initModelForLoop()
-                keypoints=[]
-                for indexFrame in range(0, nFramesVideo, imagesBatchLength):
-                    print("\nRun", iter + 1)
-                    self.readFrames(filePath, indexFrame, imagesBatchLength)
-                    keypoints.extend(keypointsPredictor.predictIteration(self.currentFrames))
-                    #self.writeTempFile(dir,fps,iter,keypointsPredictor.predictIteration(self.currentFrames))
-                    iter+=1
-                    self.currentFrames = None
-                    print("\n")
-                del keypointsPredictor.model, keypointsPredictor
-                empty_cache()
-                self.writeKeypointsToFile(detections, dir, fps)
-            #self.mergeTempFiles(dir)
-        self.writeVideoDesc(fps,nFramesVideo,type,dir)
-        if writeVideo:
-            if extractGaze:
-                print("Write gaze and keypoints videos")
-                if matchPointsBox:
-                    self.writeTrackedOutputsToVideos(detections, dir, fps, nFramesVideo, panoptic) #TODO
-                else:
-                    self.writeOutputsToVideos(keypoints,detections,dir,fps,nFramesVideo, panoptic)
-            else:
-                print("Write keypoints video")
-                self.writeKeypointsToVideo(detections, dir, fps, nFramesVideo)
-            print("Write mosaic video")
-            self.writeMosaicVideo(filePath,dir,fps,nFramesVideo,extractGaze)
+            sw, sh = self._src_size or self.size
+            image = np.zeros((sh, sw, 3), np.uint8)
+        src = (int(image.shape[1]), int(image.shape[0]))
+        gazes = draw_gazes(result, self.size, src)
+        keypoints = draw_keypoints(result, self.size, src)
+        headpose = draw_headpose(image, result)
+        overlay = draw_overlay(image, result, None if frame is None else frame.intrinsics)
+        w, h = self.size
+        mosaic = compose_mosaic([image, headpose, gazes, keypoints], (2, 2), (2 * w, 2 * h))
+        for name, img in (("gazes", gazes), ("keypoints", keypoints), ("headpose", headpose),
+                          ("overlay", overlay), ("mosaic", mosaic)):
+            self.sinks[name].write_image(img)
 
-    def writeMosaicVideo(self,rawPath,dir,fps,nFrames,withGaze):
+    def close(self) -> None:
+        for s in self.sinks.values():
+            s.close()
+
+
+# ------------------------------------------------------------------ processor
+class VideoProcessor:
+    """Runs the VFOA pipeline over a video and writes the legacy outputs.
+
+    ``args`` is a legacy argparse namespace, a :class:`Config` or a config
+    mapping (see :func:`config_from_legacy_args`). ``matrix_Q``/``disp`` are
+    optional precomputed Q matrices and disparities (``Depth_Estimator``);
+    ``w``/``h`` the size of the gaze/keypoint feature videos.
+    """
+
+    def __init__(self, args: Any, matrix_Q: Any = None, disp: Optional[Sequence[Any]] = None,
+                 w: int = 960, h: int = 720) -> None:
+        self.config = args
+        self.cfg: Config = config_from_legacy_args(args)
+        self.matrix_Q = matrix_Q
+        self.disp = disp
+        self.outputWidth = int(w)
+        self.outputHeight = int(h)
+        self.inputW = self.inputH = 0
+        self.extraSinks: list = []
+        self.directory: Optional[Path] = None
+        self.summary: dict = {}
+        self.report: str = ""
+        self.pipeline: Optional[Pipeline] = None
+
+    # -------------------------------------------------------------- main entry
+    def processVideo(self, filePath: Any, imagesBatchLength: int = 10000, extractGaze: bool = True,
+                     writeVideo: bool = True, matchPointsBox: bool = False, *,
+                     outputDir: Any = None) -> dict:
+        """Stream ``filePath`` (video, image directory, camera index or ``synthetic``) through the pipeline.
+
+        ``imagesBatchLength`` is accepted for compatibility and ignored (the
+        input is streamed, so any length works with consistent track ids).
+        ``extractGaze=False`` disables the head-pose and gaze stages;
+        ``matchPointsBox`` sets ``persons.match_keypoints``. Outputs go to
+        ``outputDir`` or ``<output.dir>/<input stem>/`` (created, never wiped).
+        Returns the run summary (also in ``self.summary``).
         """
-        Writes a video composed of the original on the left side, the predicted keypoints on the right top and the predicted gaze on the right bottom.
-        Writes first a blank video to serve as background for the overlaying videos. Uses the python fffmpeg interface.
-        :param rawPath: path of the original video file
-        :param dir: output directory
-        :param fps: frames per second of the original video
-        :param nFrames: total number of frames of the original video
-        :param withGaze: boolean, if True, add gaze video to mosaic.
-        """
-        w=cv2.VideoWriter(dir + "null.mp4", cv2.VideoWriter_fourcc(*'mp4v'), round(fps),(1920, 1460))
-        blank=zeros((1460, 1920, 3), uint8)
-        for i in range(nFrames):
-            w.write(blank)
-        w.release()
-        stream=ffmpeg.input(dir + "null.mp4").overlay(ffmpeg.input(rawPath).filter('setpts', "PTS-STARTPTS").filter('scale', 960, 720), x=0,y=0)\
-            .overlay(ffmpeg.input(dir + "keypoints.mp4").filter('setpts',"PTS-STARTPTS"), x=960,y=730)
-        if withGaze:
-            stream=stream.overlay(ffmpeg.input(dir+"gazes.mp4").filter('setpts',"PTS-STARTPTS"),x=0,y=730)
-        if 1:
-            stream=stream.overlay(ffmpeg.input(dir+"headpose.mp4").filter('setpts',"PTS-STARTPTS"),x=960,y=0)
-        stream.output(dir+"mosaic.mp4",vcodec="libx264").run()
-        os.remove(dir+"null.mp4")
+        cfg = copy.deepcopy(self.cfg)
+        return self._process(cfg, filePath, extractGaze, writeVideo, matchPointsBox, outputDir)
 
-    def readFrames(self, filePath, indexBegin=0, numberFrames=maxsize):
-        """
-        Reads a video file and stores the frames from indexBegin to numberFrames into the attribtue self.currentFrames.
-        :param filePath: path of the video file
-        :param indexBegin: index of the first frame to store
-        :param numberFrames: number of frames to store
-        """
-        self.currentFrames = []
-        cap = cv2.VideoCapture(filePath)
-        i = 0
-        while i < indexBegin:
-            read, _ = cap.read()
-            if not read:
-                break
-            i += 1
-        i = 0
-        while i < numberFrames:
-            read, img = cap.read()
-            if not read:
-                break
-            self.currentFrames.append(img)
-            i += 1
-        cap.release()
-        return i
+    def _process(self, cfg: Config, filePath: Any, extractGaze: bool, writeVideo: bool,
+                 matchPointsBox: bool, outputDir: Any) -> dict:
+        if filePath is not None:
+            cfg.input.path = str(filePath)
+            cfg.input.source = "auto"
+        if not extractGaze:
+            cfg.gaze.backend = "none"
+            cfg.headpose.backend = "none"
+        cfg.persons.match_keypoints = bool(matchPointsBox)
+        if cfg.depth.get("backend") == "stereo_bm" and not cfg.input.get("right_path") and self.disp is None:
+            fallback = "sintel_gt" if cfg.input.get("depth_dir") else "constant"
+            logger.warning("depth.backend stereo_bm needs a right view (input.right_path); using %s", fallback)
+            cfg.depth.backend = fallback
+        if cfg.input.get("path") is None:
+            raise ValueError("no input: pass a video path or set input.path")
+        stem = Path(str(cfg.input.path).rstrip("/\\")).stem or "input"
+        out_dir = Path(outputDir) if outputDir is not None else Path(cfg.output.get("dir") or "outputs") / stem
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cfg.output.dir = str(out_dir)
+        self.directory = out_dir
+        dump_config(cfg, out_dir / "config.yaml")
 
-    def extractFeaturesFromCurrentVideo(self, fps,matchPointsBox,frameBegin=0):
-        """
-        Extracts features from the frames currently stored in self.currentFrames : predicts the upper body keypoints, the head boxes, matches them for the same
-        individual and builds a map of each frame and its extracted features. Then estimates gaze and adds it to the map, and returns the map.
-        :param fps: frames per second of the video
-        :return:
-        """
-        t = timeSeconds()
-        # ! OpenPose 
-        # Test NOW
-        print("----------------------------")
-        print("----------------------------")
+        backends = None
+        if self.disp is not None:
+            backends = {"depth": PrecomputedDepth(cfg, self.matrix_Q, self.disp)}
+        source = open_input(cfg)
+        fps = float(getattr(source, "fps", None) or 30.0)
+        self.inputW = int(getattr(source, "width", 0) or 0)
+        self.inputH = int(getattr(source, "height", 0) or 0)
+        sinks: list = []
+        try:
+            if cfg.output.get("jsonl", True):
+                sinks.append(JsonlSink(out_dir / "results.jsonl"))
+            sinks.append(CsvSink(out_dir / "results.csv"))
+            if writeVideo:
+                sinks.append(FeatureVideoSink(out_dir, fps, (self.outputWidth, self.outputHeight)))
+            sinks.extend(self.extraSinks)
+        except Exception:
+            for s in sinks:
+                s.close()
+            source.close()
+            raise
+        self.pipeline = Pipeline(cfg, backends)
+        summary = self.pipeline.run(source, sinks)
+        self.summary = summary
+        self.report = self.pipeline.timer.report()
+        with open(out_dir / "timing.json", "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(summary, fh, indent=1, sort_keys=True, default=str)
+        desc = {
+            "Width": self.inputW,
+            "Height": self.inputH,
+            "NumberFrames": int(summary.get("frames", 0) or 0),
+            "FrameRate": fps,
+        }
+        with open(out_dir / "features.desc", "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(desc, fh)
+        return summary
 
-        keypointsPredictor = OpenPosePredictor(self.config)
-        keypoints = keypointsPredictor(self.currentFrames)
-        del keypointsPredictor
-        empty_cache()
-        # ! DensePose 
-        boundingBoxesPredictor = DensePosePredictor(self.config.dpCfg, self.config.dpM, self.config.dpT,
-                                                    self.config.dpB)
-        boxes = boundingBoxesPredictor(self.currentFrames)
-        del boundingBoxesPredictor
-        empty_cache()
-        # ! Gaze Direction
-        mapFramesOutputs = self.tracker.trackInterFrames(keypoints, boxes)
-        gazePredictor: GazePredictor = GazePredictor(self.config.gM, self.config.gB,
-                                                     uncertaintyThreshold=self.config.gT)
-        gazesList = gazePredictor(self.currentFrames, mapFramesOutputs, fps)
-        del gazePredictor
-        empty_cache()
-        # ! Head Pose
-        # TODO: validation
-        headPredictor: HeadPredictor = HeadPredictor(self.config.hM1,self.config.hM2, self.config.gB)
-        headList = headPredictor(self.currentFrames, mapFramesOutputs, fps)
-        del headPredictor
-        empty_cache()
-        mapFramesOutputs.addGazes(gazesList)
-        mapFramesOutputs.addHeadPose(headList)
-        
-        # ! Panoptic
-        panopticPredictor = PanopticPredictor(self.config.PpCfg, self.config.PpM, self.config.PpT,
-                                                    self.config.PpB)
-        all_seg, self.metadata = panopticPredictor(self.currentFrames)
-        del panopticPredictor
-        empty_cache()
-        #! Reconstruction
-        reconst_3d = Reconstruction(self.metadata, self.matrix_Q, self.directory)
-        points = reconst_3d(self.currentFrames, self.disp, all_seg, mapFramesOutputs)
-        del reconst_3d
-        t = timeSeconds() - t
-        print("Total extraction length :", t, " seconds ; ", len(self.currentFrames) / t, "frames per second")
-        # TODO: return the all segmentation of panoptic
-        if matchPointsBox:
-            return mapFramesOutputs, all_seg
-        else:
-            return keypoints,mapFramesOutputs, all_seg
+    def generateVideosWithFeatures(self, filePath: str, outputPath: Any, indexBegin: int = 0,
+                                   numberFrames: int = sys.maxsize) -> dict:
+        """Process ``numberFrames`` frames from ``indexBegin`` and write the feature videos to ``outputPath``."""
+        cfg = copy.deepcopy(self.cfg)
+        cfg.input.start = int(indexBegin)
+        if numberFrames is not None and numberFrames < sys.maxsize:
+            cfg.input.max_frames = int(numberFrames)
+        return self._process(cfg, filePath, True, True, bool(cfg.persons.get("match_keypoints", False)),
+                             outputPath)
 
-    def writeVideoDesc(self,fps,nFrames,type,dir):
-        """
-        Writes a description file of the processed video : contains the array type of the frames, their width and height, their number and their rate.
-        :param fps: frames per second of the original video
-        :param nFrames: number of frames of the original video
-        :param type: number array type of the video frames
-        :param dir: output directory
-        :return:
-        """
-        out=open(dir+"features.desc","w")
-        out.write(str({"FrameType":type,"Width":int(self.inputW),"Height":int(self.inputH),"NumberFrames":nFrames,"FrameRate":int(fps)}))
-        out.close()
+    # -------------------------------------------------------------- legacy drawing helpers
+    def _eye(self, bbox: Any, image: np.ndarray, normalise: bool) -> np.ndarray:
+        b = np.asarray(bbox, dtype=np.float64).reshape(-1)[:4]
+        eye = np.array([(b[0] + b[2]) / 2.0, 0.65 * b[1] + 0.35 * b[3]])
+        if normalise and self.inputW and self.inputH:
+            eye = eye * (image.shape[1] / self.inputW, image.shape[0] / self.inputH)
+        return eye
 
-    def writeKeypointsToFile(self, listsKeypoints, dir, fps):
-        """
-        Writes the predicted keypoints into a file : each files begins with a timestamp, then the JSON reprezentation of the features.
-        :param listsKeypoints:
-        :param dir:
-        :param fps:
-        :return:
-        """
-        fileString = ""
-        step = float16(1.0 / fps)
-        initTime = timeSeconds()
-        for list in listsKeypoints:
-            jsonString = {}
-            for j, detection in enumerate(list):
-                partsDict = {}
-                for i, part in detection.body_pparts.items():
-                    partsDict[i] = {"x": part.x, "y": part.y}
-                jsonString[j] = partsDict
-            fileString += str(round(initTime, 3)) + " " + str(jsonString) + "\n"
-            initTime += step
-        out = open(dir + "keypoints.timestamp", 'w')
-        out.write(fileString)
-        out.close()
+    def getFullImage(self, image: np.ndarray, bbox: Any, gaze: Any) -> np.ndarray:
+        """New image: ``image`` with the gaze arrow at the eye pixel of ``bbox`` (input pixels)."""
+        img = np.asarray(image)
+        if img.dtype != np.uint8:
+            img = np.clip(img, 0, 255).astype(np.uint8)
+        return draw_gaze_arrow(img, self._eye(bbox, img, True), gaze, 0.1 * img.shape[1])
 
-    def writeTrackedOutputsToFile(self, mapFramesOutputs, dir, fps):
-        """
-        Writes the predicted features (keypoints, head boxes, gaze) in a file : each line begons with a timestamp, then the JSON representation of the features.
-        :param mapFramesOutputs:
-        :param dir:
-        :param fps:
-        :return:
-        """
-        fileString = ""
-        step = float16(1.0 / fps)
-        initTime = timeSeconds()
-        for frame, listInstances in mapFramesOutputs.items():
-            jsonString = {}
-            if listInstances:
-                for instanceId, features in listInstances.items():
-                    instanceString = {}
-                    if "kp" in features:
-                        parts = features["kp"].body_parts
-                        if parts:
-                            partsDict = {}
-                            for i, part in parts.items():
-                                partsDict[i] = {"x": part.x, "y": part.y}
-                            instanceString["kp"] = partsDict
-                    if "b" in features:
-                        instanceString["b"] = list(map(int, features["b"]))
-                    if "g" in features:
-                        instanceString["g"] = list(features["g"])
-                    if "hp" in features:
-                        instanceString["hp"] = list(features["hp"])
-                    jsonString[instanceId] = instanceString
-            fileString += str(round(initTime, 3)) + " " + str(jsonString) + "\n"
-            initTime += step
-        out = open(dir + "features.timestamp", 'w')
-        out.write(fileString)
-        out.close()
-    
-    def writeTrackedOutputsToFilesSep(self, mapFramesOutputs, dir, fps):
-        """
-        Writes the predicted features (keypoints, head boxes, gaze, head pose) in three files. Each line describes a frame, begins with a timestamp, then the string representation of the features map.
-        The features are a map of individuals index ID and its associated feature. Across the files, an index ID refers to the same individual.
-        :param mapFramesOutputs: MapFramesOutputs object, with keypoints, boxes and gazes as outputs.
-        :return:
-        """
-        print("Write matched features with timestamp in text files")
-        fileString1, fileString2, fileString3, fileString4= "", "", "", ""
-        step = float16(1.0 / fps)
-        initTime = timeSeconds()
-        for frame, listInstances in mapFramesOutputs.items():
-            jsonString1, jsonString2, jsonString3, jsonString4 = {}, {}, {}, {}
-            if listInstances:
-                for instanceId, features in listInstances.items():
-                    jsonString1[instanceId], jsonString2[instanceId], jsonString3[instanceId], jsonString4[instanceId] = {}, {}, {}, {}
-                    if "kp" in features:
-                        for i, part in features["kp"].body_parts.items():
-                            jsonString1[instanceId][i] = [part.x, part.y]
-                    if "b" in features:
-                        jsonString2[instanceId]["b"] = [coord for coord in features["b"]]
-                        if "g" in features:
-                            jsonString3[instanceId]["g"] = [coord for coord in features["g"]]
-                        if "hp" in features:
-                            jsonString4[instanceId]["hp"] = [coord for coord in features["hp"]]
-            fileString1 += str(round(initTime, 3)) + " " + str(jsonString1) + "\n"
-            fileString2 += str(round(initTime, 3)) + " " + str(jsonString2) + "\n"
-            fileString3 += str(round(initTime, 3)) + " " + str(jsonString3) + "\n"
-            fileString4 += str(round(initTime, 3)) + " " + str(jsonString4) + "\n"
-            initTime += step
-        out1, out2, out3, out4 = open(dir + "keypoints" + ".timestamp", 'w'), open(
-            dir + "boxes" + ".timestamp", 'w'), open(dir + "gazes" + ".timestamp",'w'), open(dir + "headpose" + ".timestamp",'w')
-        out1.write(fileString1)
-        out2.write(fileString2)
-        out3.write(fileString3)
-        out4.write(fileString4)
-        out1.close()
-        out2.close()
-        out3.close()
-        out4.close()
+    def getFullImageHP(self, image: np.ndarray, bbox: Any, headpose: Any) -> np.ndarray:
+        """New image: ``image`` with the FSA-Net (yaw, pitch, roll) axes at the eye pixel of ``bbox``."""
+        eye = self._eye(bbox, np.asarray(image), False)
+        return self.draw_axis(image, headpose[0], headpose[1], headpose[2], tdx=eye[0], tdy=eye[1], size=50)
 
-    def writeOutputsToFilesSep(self, keypoints, mapBoxesGazes, dir, fps):
-        """
-        Writes the predicted features (keypoints, head boxes, gaze) in three files. Each line describes a frame, begins with a timestamp, then the string representation of the features map.
-        The boxes and gazes features are a map of individuals index ID and its associated feature. Across the boxes and gazes files, an index ID refers to the same individual.
-        :param keypoints: list of lists of Human Object with keypoints attribute (dict).
-        :param mapBoxesGazes: MapFramesOutputs object, with boxes and gazes as outputs.
-        """
-        print("Write features with timestamp in text files")
-        #! write outputs
-        fileString1, fileString2, fileString3,  fileString4 = "", "", "", ""
-        step = float16(1.0 / fps)
-        initTime = timeSeconds()
-        for listInstances, listBoxesGazes in zip(keypoints, mapBoxesGazes.map.values()):
-            jsonString1, jsonString2, jsonString3, jsonString4 = [], {}, {}, {}
-            for id, human in enumerate(listInstances):
-                pointsList = {}
-                for i, part in human.body_parts.items():
-                    pointsList[i] = [part.x, part.y]
-                jsonString1.append(pointsList)
-            for id, features in listBoxesGazes.items():
-                jsonString2[id] = [coord for coord in features["b"]]
-                if "g" in features:
-                    jsonString3[id] = [coord for coord in features["g"]]
-                if "g" in features:
-                    jsonString4[id] = [coord for coord in features["hp"]]
-            fileString1 += str(round(initTime, 3)) + " " + str(jsonString1) + "\n"
-            fileString2 += str(round(initTime, 3)) + " " + str(jsonString2) + "\n"
-            fileString3 += str(round(initTime, 3)) + " " + str(jsonString3) + "\n"
-            fileString4 += str(round(initTime, 3)) + " " + str(jsonString4) + "\n"
-            initTime += step
-        out1, out2, out3, out4 = open(dir + "keypoints" + ".timestamp", 'w'), open(
-            dir + "boxes" + ".timestamp", 'w'), open(dir + "gazes" + ".timestamp",'w'), open(dir + "headpose" + ".timestamp",'w')
-        out1.write(fileString1)
-        out2.write(fileString2)
-        out3.write(fileString3)
-        out4.write(fileString4)
-        out1.close()
-        out2.close()
-        out3.close()
-        out4.close()
-
-    def writeOutputsToFiles(self,keypoints,mapBoxesGazes,dir,fps,suffix=""):
-        #! write to files v1
-        fileString1,fileString2 = "",""
-        step = float16(1.0 / fps)
-        initTime = timeSeconds()
-        for listInstances,listBoxesGazes in zip(keypoints,mapBoxesGazes.map.values()):
-            jsonString1,jsonString2 = {},{}
-            for id, human in enumerate(listInstances):
-                jsonString1[id]={}
-                for i, part in human.body_parts.items():
-                    jsonString1[id][i] = [part.x, part.y]
-            for id,features in listBoxesGazes.items():
-                jsonString2[id] = {"b":[coord for coord in features["b"]]}
-                if "g" in features:
-                    jsonString2[id]["g"]=[coord for coord in features["g"]]
-                if "hp" in features:
-                    jsonString2[id]["hp"]=[coord for coord in features["hp"]]
-            fileString1 += str(round(initTime, 3)) + " " + str(jsonString1) + "\n"
-            fileString2 += str(round(initTime, 3)) + " " + str(jsonString2) + "\n"
-            initTime += step
-        out1,out2 = open(dir + "keypoints.timestamp", 'w'),open(dir + "boxes_gazes.timestamp", 'w')
-        out1.write(fileString1)
-        out2.write(fileString2)
-        out1.close()
-        out2.close()
-
-    def writeTrackedOutputsToVideos(self, map, dir, fps, nFrames, panoptic):
-        """
-        Writes the predicted keypoints and gazes of a video on 2 separate videos, on a black background.
-        :param map:
-        :param dir:
-        :param fps:
-        :param nFrames:
-        :return:
-        """
-        videoGazes = cv2.VideoWriter(dir + "gazes.mp4", cv2.VideoWriter_fourcc(*'mp4v'), round(fps),
-                                 (self.outputWidth, self.outputHeight))
-        videoKeypoints = cv2.VideoWriter(dir + "keypoints.mp4", cv2.VideoWriter_fourcc(*'mp4v'), round(fps),
-                                     (self.outputWidth, self.outputHeight))
-        videoHeadPose = cv2.VideoWriter(dir + "headpose.mp4", cv2.VideoWriter_fourcc(*'mp4v'), round(fps),
-                                        (self.outputWidth, self.outputHeight))   
-        videoPanoptic = cv2.VideoWriter(dir + "panoptic.mp4", cv2.VideoWriter_fourcc(*'mp4v'), round(fps),
-                                        (self.outputWidth, self.outputHeight))        
-        self.gazeRenderer = OpenGLVectorRenderer(self.outputWidth, self.outputHeight, 140)
-        self.gazeRenderer.compileShader()
-        step = nFrames // 10
-        for i in range(nFrames):
-            if (i % step) == 0:
-                print(i, "frames added to videos with features")
-            imageGazes = zeros((self.outputHeight, self.outputWidth, 3), uint8)
-            imagePoints = zeros((self.outputHeight, self.outputWidth, 3), uint8)
-            imageHead = self.currentFrames[i]
-            imagePanoptic = self.currentFrames[i]
-            if i in map.map:
-                pointsList = []
-                for id_t in map.getFrame(i).keys():
-                    points = map.getKeypoints(i, id_t)
-                    if points is not None:
-                        pointsList.append(points)
-                    bbox = map.getHeadBox(i, id_t)
-                    if bbox is not None:
-                        gaze = map.getGaze(i, id_t)
-                        head = map.getHeadPose(i, id_t)
-                        if gaze is not None:
-                            imageGazes = self.getFullImage(imageGazes, bbox, gaze)
-                        if head is not None:
-                            imageHead = self.getFullImageHP(imageHead, bbox, head)
-                if len(pointsList) > 0:
-                    imagePoints = draw_humans(imagePoints, pointsList)
-                imagePanoptic=self.draw_panoptic(panoptic[i],imagePanoptic)
-
-            videoPanoptic.write(cv2.resize(imagePanoptic, (self.outputWidth, self.outputHeight), interpolation =cv2.INTER_AREA))
-            videoHeadPose.write(cv2.resize(imageHead, (self.outputWidth, self.outputHeight), interpolation =cv2.INTER_AREA))
-            videoKeypoints.write(imagePoints.astype(uint8))
-            videoGazes.write(imageGazes.astype(uint8))
-        videoGazes.release()
-        videoKeypoints.release()
-        videoPanoptic.release()
-        videoHeadPose.release()
-
-    def writeOutputsToVideos(self,keypoints,map,dir,fps,nFrames, panoptic):
-        """
-                Writes the predicted keypoints and gazes of a video on 2 separate videos, on a black background.
-                :param map:
-                :param dir:
-                :param fps:
-                :param nFrames:
-                :return:
-                """
-        #listaH, listaG =self.objects2d(keypoints,map, panoptic, nFrames)
-        #self.writeobjects(listaG, listaH, dir)
-        videoGazes = cv2.VideoWriter(dir + "gazes.mp4", cv2.VideoWriter_fourcc(*'mp4v'), round(fps),
-                                    (self.outputWidth, self.outputHeight))
-        videoKeypoints = cv2.VideoWriter(dir + "keypoints.mp4", cv2.VideoWriter_fourcc(*'mp4v'), round(fps),
-                                        (self.outputWidth, self.outputHeight))
-        videoHeadPose = cv2.VideoWriter(dir + "headpose.mp4", cv2.VideoWriter_fourcc(*'mp4v'), round(fps),
-                                        (self.outputWidth, self.outputHeight)) 
-        videoPanoptic = cv2.VideoWriter(dir + "panoptic.mp4", cv2.VideoWriter_fourcc(*'mp4v'), round(fps),
-                                        (self.outputWidth, self.outputHeight))                              
-        self.gazeRenderer = OpenGLVectorRenderer(self.outputWidth, self.outputHeight, 140)
-        self.gazeRenderer.compileShader()
-        step = nFrames // 10
-        for i,(listHumans,listBoxesGazes) in enumerate(zip(keypoints,map.items())):
-            if (i % step) == 0:
-                print(i, "frames added to videos with features")
-            #! black background or frame
-            imageGazes = zeros((self.outputHeight, self.outputWidth, 3), uint8)
-            imageHead = np.copy(self.currentFrames[i])
-            imagePanoptic = np.copy(self.currentFrames[i])
-            for id_t in listBoxesGazes[1].keys():
-                bbox = map.getHeadBox(i, id_t)
-                if bbox is not None:
-                    gaze = map.getGaze(i, id_t)
-                    head = map.getHeadPose(i, id_t)
-                    if gaze is not None:
-                        imageGazes = self.getFullImage(imageGazes, bbox, gaze)
-                    if head is not None:
-                        imageHead = self.getFullImageHP(imageHead, bbox, head)
-            imagePanoptic=self.draw_panoptic(panoptic[i],imagePanoptic)
-
-            videoPanoptic.write(cv2.resize(imagePanoptic, (self.outputWidth, self.outputHeight), interpolation =cv2.INTER_AREA))
-            videoHeadPose.write(cv2.resize(imageHead, (self.outputWidth, self.outputHeight), interpolation =cv2.INTER_AREA))
-            videoGazes.write(imageGazes.astype(uint8))
-            videoKeypoints.write(draw_humans(zeros((self.outputHeight, self.outputWidth, 3), uint8), listHumans).astype(uint8))
-        videoGazes.release()
-        videoKeypoints.release()
-        videoHeadPose.release()
-        videoPanoptic.release()
-
-    def writeKeypointsToVideo(self, listsKeypoints, dir, fps, nFrames):
-        """
-        Writes predicted keypoints in a video file, on a black background.
-        :param listsKeypoints:
-        :param dir:
-        :param fps:
-        :param nFrames:
-        :return:
-        """
-        videoKeypoints = cv2.VideoWriter(dir + "keypoints.mp4", cv2.VideoWriter_fourcc(*'mp4v'), round(fps),
-                                     (self.outputWidth, self.outputHeight))
-        step = nFrames / 10
-        for i, listHumans in enumerate(listsKeypoints):
-            if (i % step) == 0:
-                print(i, "frames added to videos with features")
-            imagePoints = zeros((self.outputHeight, self.outputWidth, 3), uint8)
-            if len(listHumans) > 0:
-                imagePoints = draw_humans(imagePoints, listHumans)
-            videoKeypoints.write(imagePoints.astype(uint8))
-        videoKeypoints.release()
-
-    def getFullImage(self, image, bbox, gaze):
-        """
-        Overlays an arrow that represents the gaze estimation on an image.
-        :param image:
-        :param bbox:
-        :param gaze:
-        :return:
-        """
-        bbox = asarray(bbox).astype(float)
-        bbox[0], bbox[1], bbox[2], bbox[3] = bbox[0] / self.inputW, bbox[1] / self.inputH, bbox[2] / self.inputW, bbox[
-            3] / self.inputH
-        eyes = [((bbox[0] + bbox[2]) / 2), (0.65 * bbox[1] + 0.35 * bbox[3])]
-        arrow = self.gazeRenderer.renderArrow(eyes, gaze, 0.05)
-        binary_img = reshape(((arrow[:, :, 0] + arrow[:, :, 1] + arrow[:, :, 2]) == 0.0).astype(float),
-                             (self.outputHeight, self.outputWidth, 1))
-        binary_img = concatenate((binary_img, binary_img, binary_img), axis=2)
-        return (binary_img * image + arrow * (1 - binary_img)).astype(float)
-
-    def getImageWithBox(self, image, bbox, id):
-        return cv2.rectangle(image.astype(uint8), (bbox[0], bbox[1]), (bbox[2], bbox[3]),
-                         self.boxesRandomColors[min(id, 900)]).astype(float)
-
-    def getFullImageHP(self, image, bbox, headpose):
-        """
-        Overlays the axis of head pose that represents the head estimation on an image.
-        :param image:
-        :param bbox:
-        :param headpose:
-        :return:
-        """
-        bbox = asarray(bbox).astype(float)
-        eyes = [((bbox[0] + bbox[2]) / 2), (0.65 * bbox[1] + 0.35 * bbox[3])]
-        #yaw, pitch, roll
-        #headpose[0],headpose[1],headpose[2]
-        
-        return  (self.draw_axis(image,headpose[0],headpose[1],headpose[2],tdx=eyes[0],tdy=eyes[1],size=50))
-
-    def draw_axis(self, img, yaw, pitch, roll, tdx=None, tdy=None, size = 50,thickness=(2,2,2)):
-
-        """
-        Function used to draw y (headpose label) on Input Image x.
-        Implemented by: shamangary
-        https://github.com/shamangary/FSA-Net/blob/master/demo/demo_FSANET.py
-        Modified by: Omar Hassan
-        """
-        pitch = pitch * np.pi / 180
-        yaw = -(yaw * np.pi / 180)
-        roll = roll * np.pi / 180
-
-        if tdx != None and tdy != None:
-            tdx = tdx
-            tdy = tdy
-        else:
-            height, width = img.shape[:2]
-            tdx = width / 2
-            tdy = height / 2
-
-        # X-Axis pointing to right. drawn in red
-        x1 = size * (np.cos(yaw) * np.cos(roll)) + tdx
-        y1 = size * (np.cos(pitch) * np.sin(roll) + np.cos(roll) * np.sin(pitch) * np.sin(yaw)) + tdy
-
-        # Y-Axis | drawn in green
-        #        v
-        x2 = size * (-np.cos(yaw) * np.sin(roll)) + tdx
-        y2 = size * (np.cos(pitch) * np.cos(roll) - np.sin(pitch) * np.sin(yaw) * np.sin(roll)) + tdy
-
-        # Z-Axis (out of the screen) drawn in blue
-        x3 = size * (np.sin(yaw)) + tdx
-        y3 = size * (-np.cos(yaw) * np.sin(pitch)) + tdy
-
-        cv2.line(img, (int(tdx), int(tdy)), (int(x1),int(y1)),(0,0,255),thickness[0])
-        cv2.line(img, (int(tdx), int(tdy)), (int(x2),int(y2)),(0,255,0),thickness[1])
-        cv2.line(img, (int(tdx), int(tdy)), (int(x3),int(y3)),(255,0,0),thickness[2])
-
-        return img
-
-    def draw_panoptic(self, panoptic, im):
-        panoptic_seg = panoptic[0]
-        segments_info = panoptic[1]
-        v = Visualizer(im[:, :, ::-1], self.metadata, scale=1.2)
-        # TODO :  check how we did to update this
-        out = v.draw_panoptic_seg_predictions(panoptic_seg, segments_info) # .to("cpu")
-        out = out.get_image()[:, :, ::-1]
-        return out
-
-    def objects2d(self, keypoints,map, panoptic, nFrames):
-        listhead={}
-        listgaze={}
-        step = nFrames // 10
-        for i,(listHumans,listBoxesGazes) in enumerate(zip(keypoints,map.items())):
-            listaingaze={}
-            listainhead={}
-            if (i % step) == 0:
-                print(i, "frames identifying object")
-            for id_t in listBoxesGazes[1].keys():
-                bbox = map.getHeadBox(i, id_t)
-                if bbox is not None:
-                    gaze = map.getGaze(i, id_t)
-                    head = map.getHeadPose(i, id_t)
-                    bbox = asarray(bbox).astype(float)
-                    eyes = [((bbox[0] + bbox[2]) / 2), (0.65 * bbox[1] + 0.35 * bbox[3])]
-                    if gaze is not None:
-                        listaingaze[id_t] = self.findobjectGaze(eyes, gaze,panoptic[i][0],panoptic[i][2])
-                    if head is not None:
-                        listainhead[id_t] = self.findobjectHP(eyes, head[0],head[1],head[2],panoptic[i][0],panoptic[i][2])
-                    #TODO
-            listhead[i]=listainhead
-            listgaze[i]=listaingaze
-        return(listgaze, listhead)
-
-    def findobjectHP(self, eyes, pitch, yaw, roll, panoptic_seg, segments_info):
-        panoptic_seg=panoptic_seg.to("cpu").numpy()
-        pitch = pitch * np.pi / 180
-        yaw = -(yaw * np.pi / 180)
-        roll = roll * np.pi / 180
-        tdx=eyes[0]
-        tdy=eyes[1]
-        objects=[]
-        prevx=0
-        prevy=0
-        wi=self.inputW-1
-        he=self.inputH-1
-        for size in range(100,int(wi*he)):
-            x1_aux = size * (np.sin(yaw)) + tdx
-            y1_aux = size * (-np.cos(yaw) * np.sin(pitch))  + tdy
-            if x1_aux >= wi or y1_aux >= he or x1_aux <= 0 or y1_aux <= 0:
-                break
-            x1_aux=round(x1_aux)
-            y1_aux=round(y1_aux)
-            if prevx != x1_aux or prevy != y1_aux:
-                aux_object_id=panoptic_seg[y1_aux, x1_aux]
-                aux_object=segments_info[aux_object_id]
-                objects.append([x1_aux,y1_aux,aux_object])
-                prevx=x1_aux
-                prevy=y1_aux
-            
-        return(objects)
-
-    def findobjectGaze(self, eyes, gaze, panoptic_seg, segments_info):
-        panoptic_seg=panoptic_seg.to("cpu").numpy()
-        tdx=eyes[0]
-        tdy=eyes[1]
-        
-        vectorx=float(gaze[0])
-        vectory=float(gaze[1])
-        # gaze[2]
-        objects=[]
-        prevx=0
-        prevy=0
-        wi=self.inputW-1
-        he=self.inputH-1
-        for size in range(100,int(wi*he)):
-            x1_aux = size * vectorx + tdx
-            y1_aux = size * vectory + tdy
-            if x1_aux >= wi or y1_aux >= he or x1_aux <= 0 or y1_aux <= 0:
-                break
-            x1_aux=round(x1_aux)
-            y1_aux=round(y1_aux)
-            if prevx != x1_aux or prevy != y1_aux:
-                aux_object_id=panoptic_seg[y1_aux, x1_aux]
-                aux_object=segments_info[aux_object_id]
-                objects.append([x1_aux,y1_aux,aux_object])
-                prevx=x1_aux
-                prevy=y1_aux
-            
-        return(objects)
-
-    def writeobjects(self, listaG, listaH, dir):
-         #! write to files v1
-        with open(dir + "objetsH.json", 'w') as fp:
-            json.dump(listaH, fp)
-        with open(dir + "objetsG.json", 'w') as fp1:
-            json.dump(listaG, fp1)
+    def draw_axis(self, img: np.ndarray, yaw: float, pitch: float, roll: float, tdx: Optional[float] = None,
+                  tdy: Optional[float] = None, size: float = 50, thickness: Any = (2, 2, 2)) -> np.ndarray:
+        """New image with the head axes (X red, Y green, Z blue); see ``vfoa.io.outputs.draw_head_axes``."""
+        origin = None if tdx is None or tdy is None else (tdx, tdy)
+        t = thickness[0] if isinstance(thickness, (tuple, list)) else thickness
+        img = np.asarray(img)
+        if img.dtype != np.uint8:
+            img = np.clip(img, 0, 255).astype(np.uint8)
+        return draw_head_axes(img, yaw, pitch, roll, origin=origin, size=size, thickness=int(t))
