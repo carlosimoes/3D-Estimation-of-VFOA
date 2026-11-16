@@ -300,9 +300,11 @@ DEFAULTS: dict = {
     },
     "runtime": {
         "lookahead_frames": 0,
-        # null -> library defaults, except that the YOLO backends cap torch at half the
-        # logical CPUs on CPU; an int sets torch threads for the YOLO models and
-        # intra_op_num_threads for the ONNX Runtime sessions (l2cs, FSA-Net).
+        # null -> library defaults, except that on CPU the YOLO backends cap torch at half
+        # the logical CPUs, or a quarter when segmentation.async is true (the frame loop
+        # and the segmentation worker then run two torch/OpenMP pools); minimum 1, never
+        # raised. An int sets torch threads for the YOLO models and intra_op_num_threads
+        # for the ONNX Runtime sessions (l2cs, FSA-Net); 2 is a good value on a shared CPU.
         "num_threads": None,
         "seed": 0,
         "log_every": 100,
