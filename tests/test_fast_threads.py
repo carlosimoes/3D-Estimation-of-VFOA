@@ -2,11 +2,14 @@
 
 * ``_ultra.load_yolo`` resets torch's intra-op thread count after the
   warm-up predict, because ultralytics raises it at the first predict.
+* With ``segmentation.async`` the CPU default is a quarter (not half) of the
+  logical CPUs, because the segmentation worker runs a second torch pool.
 * The l2cs ONNX Runtime session disables intra-op spin-waiting.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from types import SimpleNamespace
@@ -45,7 +48,7 @@ def _fake_yolo(events: list, torch: FakeTorch | None):
     return FakeYOLO
 
 
-def _load(make_config, tmp_path, monkeypatch, torch, num_threads=None, device="cpu"):
+def _load(make_config, tmp_path, monkeypatch, torch, num_threads=None, device="cpu", seg_async=False):
     weights = tmp_path / "yolo11n-pose.pt"
     weights.write_bytes(b"x")
     events: list = []
@@ -54,7 +57,7 @@ def _load(make_config, tmp_path, monkeypatch, torch, num_threads=None, device="c
         monkeypatch.delitem(sys.modules, "torch", raising=False)
     else:
         monkeypatch.setitem(sys.modules, "torch", torch)
-    cfg = make_config("fast", {"runtime": {"num_threads": num_threads}})
+    cfg = make_config("fast", {"runtime": {"num_threads": num_threads}, "segmentation": {"async": seg_async}})
     _ultra.load_yolo(cfg, str(weights), "persons.model", imgsz=64, device=device)
     return events
 
@@ -101,6 +104,79 @@ def test_no_torch_does_nothing(make_config, tmp_path, monkeypatch):
     assert [e[0] for e in events] == ["init", "predict"]
     assert "torch" not in sys.modules
     assert _ultra.apply_torch_threads({"runtime": {"num_threads": 3}}, "cpu") is None
+
+
+# ------------------------------------------------------------------------- async segmentation
+def test_async_segmentation_caps_at_a_quarter_of_the_cpus(make_config, tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    for device in ("cpu", None):
+        torch = FakeTorch()
+        _load(make_config, tmp_path, monkeypatch, torch, device=device, seg_async=True)
+        assert torch.calls == [2], device
+        torch2 = FakeTorch()
+        _load(make_config, tmp_path, monkeypatch, torch2, device=device, seg_async=False)
+        assert torch2.calls == [4], device
+
+
+def test_async_cap_on_small_machines(make_config, tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "cpu_count", lambda: 2)
+    torch = FakeTorch()
+    _load(make_config, tmp_path, monkeypatch, torch, seg_async=True)
+    assert torch.calls == [1]
+    monkeypatch.setattr(os, "cpu_count", lambda: None)
+    torch2 = FakeTorch()
+    _load(make_config, tmp_path, monkeypatch, torch2, seg_async=True)
+    assert torch2.calls == [1]
+
+
+def test_async_cap_never_raises_the_count(make_config, tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "cpu_count", lambda: 64)
+    torch = FakeTorch()
+    _load(make_config, tmp_path, monkeypatch, torch, seg_async=True)
+    assert torch.calls == [7]  # 64 // 4 = 16, but the warm-up left 7
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    torch2 = FakeTorch(threads=1)
+    monkeypatch.setitem(sys.modules, "torch", torch2)
+    cfg = make_config("fast", {"segmentation": {"async": True}})
+    assert _ultra.apply_torch_threads(cfg, "cpu") == 1
+    assert torch2.calls == [1]
+
+
+def test_explicit_num_threads_wins_with_async(make_config, tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    for seg_async in (True, False):
+        torch = FakeTorch()
+        _load(make_config, tmp_path, monkeypatch, torch, num_threads=3, seg_async=seg_async)
+        assert torch.calls == [3], seg_async
+    torch2 = FakeTorch()
+    _load(make_config, tmp_path, monkeypatch, torch2, num_threads=3, device="cuda", seg_async=True)
+    assert torch2.calls == [3]
+
+
+def test_gpu_with_async_leaves_threads_alone(make_config, tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    torch = FakeTorch()
+    _load(make_config, tmp_path, monkeypatch, torch, device="cuda", seg_async=True)
+    assert torch.calls == []
+
+
+def test_no_torch_with_async(monkeypatch):
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    assert _ultra.apply_torch_threads({"segmentation": {"async": True}}, "cpu") is None
+    assert "torch" not in sys.modules
+
+
+def test_plain_mapping_and_log_reason(monkeypatch, caplog):
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch(threads=8))
+    caplog.set_level(logging.INFO, logger="vfoa.backends.fast._ultra")
+    assert _ultra.apply_torch_threads({"segmentation": {"async": True}}, "cpu") == 2
+    assert "segmentation.async" in caplog.records[-1].getMessage()
+    caplog.clear()
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch(threads=8))
+    assert _ultra.apply_torch_threads({}, "cpu") == 4
+    message = caplog.records[-1].getMessage()
+    assert "set to 4" in message and "segmentation.async" not in message
 
 
 # ------------------------------------------------------------------------- l2cs / onnxruntime

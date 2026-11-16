@@ -23,7 +23,8 @@ REPO = Path(__file__).resolve().parents[1]
 STAGES = ("depth", "persons", "tracking", "headpose", "gaze", "segmentation", "scene", "smoothing",
           "attention", "total")
 META_KEYS = {"profile", "input", "frames", "warmup", "resolution", "config_hash", "python", "numpy", "opencv",
-             "torch", "ultralytics", "cpu_count", "date", "backends", "fallbacks", "env"}
+             "torch", "ultralytics", "cpu_count", "date", "backends", "fallbacks", "env", "realtime",
+             "segmentation_async"}
 STAT_KEYS = {"runs", "mean_ms", "p50_ms", "p95_ms", "max_ms", "per_frame_ms", "total_ms", "share"}
 
 
@@ -195,6 +196,67 @@ def test_micro_only_cli(bench, tmp_path, capsys, monkeypatch):
     assert "speed-up 4.0x" in text and "| slab_test |" in text
 
 
+LATENCY_KEYS = {"frames", "mean_ms", "p50_ms", "p95_ms", "max_ms"}
+
+
+def _check_latency(lat: dict, frames: int) -> None:
+    assert set(lat) == LATENCY_KEYS and lat["frames"] == frames
+    assert all(math.isfinite(lat[k]) for k in LATENCY_KEYS)
+    assert lat["p50_ms"] <= lat["p95_ms"] <= lat["max_ms"]
+
+
+def test_latency_covers_measured_frames_only(bench, tmp_path, capsys):
+    code, text, data = _run(bench, tmp_path, capsys, "--frames", "12", "--warmup", "3")
+    assert code == 0 and data["status"] == "ok"
+    _check_latency(data["run"]["latency"], 12)
+    _check_latency(data["run"]["latency_all"], 15)
+    assert re.search(r"^latency capture->result:.*\(12 frames\).*measured frames", text, re.M)
+    assert data["meta"]["realtime"] is False and data["meta"]["segmentation_async"] is False
+    assert "input.realtime" not in text
+
+
+def test_latency_not_below_pipeline_latency(bench, tmp_path, capsys):
+    code, _, data = _run(bench, tmp_path, capsys, "--frames", "8", "--warmup", "0")
+    assert code == 0
+    lat, lat_all = data["run"]["latency"], data["run"]["latency_all"]
+    assert lat["frames"] == 8 and lat_all["frames"] == 8
+    # each benchmark sample starts no later and ends later than the pipeline's own (an ordering)
+    assert lat["mean_ms"] >= lat_all["mean_ms"] - 1e-6
+    assert lat["max_ms"] >= lat_all["max_ms"] - 1e-6
+
+
+def test_realtime_meta_and_note(bench, tmp_path, capsys):
+    code, text, data = _run(bench, tmp_path, capsys, "--frames", "8", "--warmup", "2",
+                            "--set", "input.realtime=true", "--set", "segmentation.async=true")
+    assert code == 0 and data["status"] == "ok"
+    meta = data["meta"]
+    assert meta["realtime"] is True and meta["segmentation_async"] is True
+    assert text.count("NOTE: input.realtime=true") == 1
+    counters = data["timing"]["counters"]
+    assert counters["captured_frames"] == 10
+    assert data["run"]["frames_total"] + counters["dropped_frames"] == 10
+    assert 1 <= meta["frames"] <= 8
+    assert meta["frames"] == data["timing"]["frames"] == data["run"]["latency"]["frames"]
+    assert any(line.startswith("async segmentation:") and "whole run" in line for line in text.splitlines())
+
+
+def test_micro_only_default_output(bench, tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(bench, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(bench, "micro_benchmarks", lambda repeats=5, small=False: {
+        "slab_test": {"status": "ok", "legacy_ms": 4.0, "new_ms": 1.0, "speedup": 4.0, "agree": True}})
+    sentinel = tmp_path / "synthetic-synthetic.json"
+    sentinel.write_bytes(b"sentinel")
+    assert bench.main(["--frames", "0", "--micro"]) == 0
+    data = json.loads((tmp_path / "micro.json").read_text(encoding="utf-8"))
+    assert data["status"] == "ok" and data["timing"] == {}
+    assert data["micro"]["slab_test"]["speedup"] == 4.0
+    assert sentinel.read_bytes() == b"sentinel"
+    # a real run keeps its default name
+    assert bench.main(["--frames", "4", "--warmup", "1"]) == 0
+    capsys.readouterr()
+    assert json.loads(sentinel.read_text(encoding="utf-8"))["status"] == "ok"
+
+
 def test_format_markdown(bench):
     result = {"status": "ok", "meta": {"profile": "synthetic", "input": "synthetic", "resolution": [64, 48],
                                        "frames": 2, "warmup": 1},
@@ -227,7 +289,7 @@ FILE_SECTIONS = {
     "vfoa/backends/accurate/gaze360.py": ("gaze", "input", "runtime", "persons"),
     "vfoa/backends/accurate/openpose_densepose.py": ("persons",),
     "vfoa/backends/accurate/panoptic_fpn.py": ("segmentation",),
-    "vfoa/backends/fast/_ultra.py": ("models", "runtime"),
+    "vfoa/backends/fast/_ultra.py": ("models", "runtime", "segmentation"),
     "vfoa/backends/fast/head_proxy_gaze.py": ("gaze",),
     "vfoa/backends/fast/keypoints_headpose.py": ("headpose", "camera", "persons"),
     "vfoa/backends/fast/l2cs_gaze.py": ("gaze", "models", "runtime"),

@@ -115,6 +115,10 @@ def load_yolo(cfg: Mapping[str, Any], model: str, config_key: str, **warmup_kwar
     (2-3 s instead of about 0.1 s) on an 8-vCPU WSL2 VM. Setting the
     variable ``OMP_WAIT_POLICY`` here would be too late, because
     :func:`vfoa.backends.base.resolve_device` has already imported torch.
+    With asynchronous segmentation the frame loop and the segmentation
+    worker each run their own torch/OpenMP team, so the CPU default is
+    lower there (a quarter instead of half of the logical CPUs); see
+    :func:`apply_torch_threads` for the rule and the measurement.
     """
     YOLO = import_yolo()
     path = resolve_weights(cfg, model, config_key)
@@ -136,13 +140,30 @@ def load_yolo(cfg: Mapping[str, Any], model: str, config_key: str, **warmup_kwar
 def apply_torch_threads(cfg: Mapping[str, Any], device: Optional[str] = None) -> Optional[int]:
     """Set torch's intra-op thread count after ultralytics has changed it.
 
-    Rules: ``runtime.num_threads`` set -> ``torch.set_num_threads(n)``; else,
-    on CPU (``device`` is ``None`` or starts with ``"cpu"``) ->
-    ``max(1, min(torch.get_num_threads(), cpu_count // 2))``, because
-    YOLO11n gains almost nothing beyond 2-4 threads while more threads
-    spin-wait against the other models; else (a GPU device) nothing.
-    torch is taken from ``sys.modules`` only (never imported here); without
-    it nothing happens. Returns the value set, or ``None``.
+    Rules, in order:
+
+    * torch is taken from ``sys.modules`` only (never imported here); without
+      it nothing happens.
+    * ``runtime.num_threads`` set -> ``torch.set_num_threads(n)`` on any device.
+    * a GPU device (``device`` neither ``None`` nor starting with ``"cpu"``)
+      -> nothing.
+    * CPU, ``segmentation.async`` false -> ``max(1, min(current,
+      cpu_count // 2))``: YOLO11n gains almost nothing beyond 2-4 threads,
+      while more threads spin-wait against the other models.
+    * CPU, ``segmentation.async`` true -> ``max(1, min(current,
+      cpu_count // 4))``. torch's thread count is process-global and is
+      re-applied in every new thread, but each thread that calls torch gets
+      its own OpenMP team: the frame loop (YOLO11n-pose) and the
+      segmentation worker (YOLO11n-seg) then each run N threads, and
+      2 x cpu_count/2 fills every CPU with spinning threads. Measured on
+      Final_videos/museum.mp4 (input.realtime + segmentation.async, 8 vCPUs,
+      load average 5-9): 4 threads 2.05 FPS (persons mean 451 ms, worker
+      853 ms); 2 threads 9.8-11.0 FPS (persons 60-69 ms, worker 111-135 ms);
+      1 thread 8.2 FPS. The lower cap also applies when the pipeline runs a
+      cached segmentation stage synchronously.
+
+    The count is never raised above torch's current value. The chosen value
+    and the reason are logged at INFO. Returns the value set, or ``None``.
     """
     torch = sys.modules.get("torch")
     if torch is None:
@@ -153,8 +174,16 @@ def apply_torch_threads(cfg: Mapping[str, Any], device: Optional[str] = None) ->
             value = int(n)
             reason = "runtime.num_threads"
         elif device is None or str(device).lower().startswith("cpu"):
-            value = max(1, min(int(torch.get_num_threads()), (os.cpu_count() or 2) // 2))
-            reason = "CPU default: half the logical CPUs (runtime.num_threads is null)"
+            seg_async = bool((cfg.get("segmentation") or {}).get("async"))
+            divisor = 4 if seg_async else 2
+            value = max(1, min(int(torch.get_num_threads()), (os.cpu_count() or 2) // divisor))
+            if seg_async:
+                reason = (
+                    "CPU default: a quarter of the logical CPUs, because segmentation.async runs "
+                    "a second torch thread pool (runtime.num_threads is null)"
+                )
+            else:
+                reason = "CPU default: half the logical CPUs (runtime.num_threads is null)"
         else:
             return None
         torch.set_num_threads(value)
