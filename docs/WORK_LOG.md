@@ -4,7 +4,8 @@ This log records the work done on the thesis repository `3D-Estimation-of-VFOA`
 from 2026-11-13 to 2026-11-16: the code review, the GitHub issues, the comparison
 with BrandPose, the latency analysis, the multi-agent refactor into the `vfoa`
 package, the gaze-model research, the new gaze backend, the CPU measurements and
-the final Fable run (benchmark, follow-up fixes, verification and report).
+the final Fable run (benchmark, follow-up fixes, verification and report) and
+the last follow-up run (`fu-fast-small-heads`).
 Umbrella tracking issue: #37.
 
 ## 1. Overview
@@ -15,15 +16,15 @@ one. The thesis models stay available, and fast models can be swapped in.
 
 **Current state**
 
-1. All 15 planned tasks, the gaze-backend task and four follow-up tasks (20 task branches) are merged into the local branch `realtime-integration`.
+1. All 15 planned tasks, the gaze-backend task and five follow-up tasks (21 task branches) are merged into the local branch `realtime-integration`.
 2. The new `vfoa` package streams frames through pluggable backends: `fast`, `accurate`/`thesis` and `synthetic`.
-3. The test suite passes on this CPU-only machine: 673 passed, 2 skipped (network tests).
-4. The final Fable run (2026-11-16, section 8) ran the verification and wrote the final report. Its verdict: 19 of the 21 in-scope issues are resolved; #23 and #35 are partial because of one open defect in the fast profile (track ids break up when tracking on small head boxes). The fix for it (`fu-fast-small-heads`) was specified but not implemented, so the verification did not complete.
+3. The test suite passes on this CPU-only machine: 682 passed, 2 skipped (network tests).
+4. The final Fable run (2026-11-16, section 8) ran the verification and wrote the final report. It left one open defect in the fast profile (track ids break up when tracking on small head boxes). The last follow-up run (section 8.4) fixed it with `fu-fast-small-heads`, and Fable's final verification is complete: **all 21 in-scope issues are addressed** and no follow-up tasks remain.
 5. Latency has been measured on CPU only. The accurate (thesis-model) backends have not been run with the real models.
 
 **Where the code lives**
 
-- Branch: `realtime-integration`, tip `1829c8a`. It is 48 commits ahead of `main` (28 commits plus 20 merges): 106 files changed, 25,137 insertions and 3,303 deletions.
+- Branch: `realtime-integration`, tip `284540b`. It is 50 commits ahead of `main` (29 commits plus 21 merges): 106 files changed, 25,314 insertions and 3,303 deletions.
 - Integration worktree: `/mnt/c/Users/CSIMOES/orca/3D-Estimation-of-VFOA-integration`.
 - Per-task branches: `task/*`, one per task (section 7).
 - This log is on the local branch `docs/work-log`, which is based on `realtime-integration` at `909decc` and is not merged.
@@ -75,6 +76,7 @@ workflow run metadata where available.
   - round 3: `r3-fu-cache-fallback`, merged as `1829c8a`.
 - **Verification** found one more defect in the fast profile (head-box tracking breaks track ids) and specified the follow-up `fu-fast-small-heads`. The run ended before it was implemented, so the verification is not complete.
 - **Final report** written by Fable (section 8).
+- **Last follow-up run:** `fu-fast-small-heads` (commit `523a18c`) was implemented by Opus, approved on the first review and merged as `284540b` (682 passed, 2 skipped). Fable's final verification completed: all 21 in-scope issues addressed, no follow-up tasks left (section 8.4).
 - **Housekeeping:** a reboot wiped the session scratch folder under `/tmp`, so the benchmark JSON files and run outputs quoted by the tasks are gone; the figures survive in `docs/performance.md` and in this log. The venv now lives at `/home/carlos/.venvs/vfoa`.
 - This work log is updated.
 
@@ -113,9 +115,9 @@ The other issues (#19-#22, #24-#28, #31, #33-#36) are improvements, evaluation w
 
 All 37 issues are still open on GitHub (nothing was closed or commented on). Their permalinks point to commit `8356bf8`.
 
-"Status" is the state on `realtime-integration` at `1829c8a`. **In-scope and
-optional statuses are the ones verified by Fable in the final report
-(2026-11-16, section 8).** "Resolved" means fixed and checked on this machine.
+"Status" is the state on `realtime-integration` at `284540b`. **In-scope and
+optional statuses are the ones verified by Fable in the final reports
+(2026-11-16, sections 8.3 and 8.4).** "Resolved" means fixed and checked on this machine.
 "Resolved (code)" means fixed and unit-tested with a fake model, because the
 real thesis model is not available here. Out-of-scope statuses come from the
 report's summary and the task reports.
@@ -139,24 +141,24 @@ report's summary and the task reports.
 | 15 | Assorted crash/edge-case bugs in VideoProcessor, Reconstruction and FinalTest | P2 | pipeline | in | Resolved (legacy entry points rewritten) | io, legacy-entry |
 | 16 | Geometry edge cases: eyes near the image border, cone parallel to the x-axis, duplicated ray | P2 | attention | in | Resolved | geometry, scene |
 | 17 | Compatibility with Python >=3.10 and NumPy 2 | P2 | engineering | in | Resolved on Python 3.12 and NumPy 2.5; Python 3.10 checked by parsing only | foundation, tracking-smoothing, depth, io, accurate-gaze-headpose, legacy-entry |
-| 18 | Tracking: IDs only matched to the previous frame; collisions drop detections | P2 | tracking | optional | Tracker fixed, but its default box choice (`tracking.box: head`) causes the track-id defect in the fast profile | tracking-smoothing, accurate-detectron |
+| 18 | Tracking: IDs only matched to the previous frame; collisions drop detections | P2 | tracking | optional | Addressed: persistent Hungarian tracker; `tracking.box` now defaults to `body` (thesis keeps `head`), so ids no longer break up | tracking-smoothing, accurate-detectron, fu-fast-small-heads |
 | 19 | Attention: replace ray-hit counting with angular (probabilistic) scoring | P2 | attention | in | Resolved | attention |
 | 20 | Attention: handle occlusion (only the first surface along the gaze should count) | P2 | attention | in | Resolved (one known gap, section 11) | attention |
-| 21 | Attention: confidence-weighted gaze/head fusion using Gaze360 uncertainty | P2 | attention, models | optional | Partial: implemented; L2CS confidence was rescaled (about 0.9) but is not yet informative (it ignores face size) | attention, r2-fu-gaze-axes |
+| 21 | Attention: confidence-weighted gaze/head fusion using Gaze360 uncertainty | P2 | attention, models | optional | Addressed: L2CS confidence now scales with face-crop size, so gaze gets the configured fusion share (median 0.60) | attention, r2-fu-gaze-axes, fu-fast-small-heads |
 | 22 | Attention: tighter object geometry than axis-aligned bounding boxes | P3 | depth, attention | out | Open. The angular method scores sampled surface points, not boxes, which goes part of the way. | - |
-| 23 | Temporal smoothing: integrate the Kalman filter and add a temporal model over the attention target | P2 | attention | in | **Partial:** works on stable tracks; defeated by the track-id defect in the fast profile | tracking-smoothing, pipeline |
+| 23 | Temporal smoothing: integrate the Kalman filter and add a temporal model over the attention target | P2 | attention | in | Resolved: track ids are stable on the repository clips, so per-track Kalman smoothing and the target HMM work | tracking-smoothing, pipeline, fu-fast-small-heads |
 | 24 | Evaluate newer models per stage (stereo/depth, head detection, head pose, gaze target) | P3 | models | out | Open. YOLO11 and L2CS backends were added, but no evaluation was done. | - |
 | 25 | Evaluation: create ground-truth attention annotations and report accuracy | P2 | evaluation | out | Open | - |
 | 26 | Evaluation: ablation of cues and fusion strategies | P2 | attention, evaluation | out | Open. The config switches exist; no ablation was run. | - |
 | 27 | Evaluation: measure depth accuracy against Sintel ground-truth depth | P2 | depth, evaluation | out | Open. Only unit-level checks against the ground truth exist. | - |
 | 28 | Cache per-stage outputs so attention can be re-run without the models | P2 | pipeline, engineering | in | Resolved: re-scoring ran with all model libraries blocked; a complete cache is served without the model (r3-fu-cache-fallback) | synthetic-cache, pipeline, r3-fu-cache-fallback |
 | 29 | Reproducibility: config file, pinned environment, remove hard-coded absolute paths | P2 | engineering | out | Partial (side effect): YAML configs, requirements files and no hard-coded paths; versions are not pinned | foundation |
-| 30 | Add unit tests for the geometry and attention code | P1 | attention, engineering | in | Resolved (675 tests). The CI workflow exists but has not run on GitHub. | foundation, geometry, synthetic-cache, attention, benchmark-docs |
+| 30 | Add unit tests for the geometry and attention code | P1 | attention, engineering | in | Resolved (684 tests). The CI workflow exists but has not run on GitHub. | foundation, geometry, synthetic-cache, attention, benchmark-docs |
 | 31 | Structured outputs with frame-based timestamps instead of str(dict) lines and long-form CSV | P3 | pipeline | optional | Resolved | io, legacy-entry |
 | 32 | Performance: drop the PLY round-trip, duplicate StereoBM, model reloads and in-RAM video | P3 | engineering | in | Resolved: micro-benchmarks (PLY 51x, ray-box 25x, StereoBM 9x faster) and `docs/performance.md` | depth, io, accurate-detectron, scene, accurate-gaze-headpose, pipeline, legacy-entry, benchmark-docs, r2-fu-rt-cpu-threads |
 | 33 | Remove dead and duplicated code | P3 | engineering | out | Open | - |
 | 34 | Repo hygiene: keep media/data out of git and normalize line endings | P3 | engineering | out | Open | - |
-| 35 | Real-time / on-robot mode | P3 | pipeline | in | **Partial:** runs end to end with per-stage timings; same track-id defect; GPU speed not measured | foundation, fast-backends, pipeline, realtime, l2cs-gaze, benchmark-docs, r2-fu-rt-cpu-threads, r2-fu-gaze-axes |
+| 35 | Real-time / on-robot mode | P3 | pipeline | in | Resolved on CPU: runs end to end with frame dropping, async segmentation and stable ids; GPU speed not measured | foundation, fast-backends, pipeline, realtime, l2cs-gaze, benchmark-docs, r2-fu-rt-cpu-threads, r2-fu-gaze-axes, fu-fast-small-heads |
 | 36 | README: align claims with the implementation | P2 | documentation | out | Partly addressed as a side effect: the README was rewritten | benchmark-docs, r2-fu-docs-perf |
 | 37 | Tracking: code review findings and improvement plan (umbrella) | - | documentation | - | Open | - |
 
@@ -308,6 +310,7 @@ review requested changes; the log gives the number of changes requested.
 | r2-fu-gaze-axes (final run) | benchmark-docs | #2 #7 #21 #35 | 1 | `70677a7` | `task/r2-fu-gaze-axes` `99bb5e0` |
 | r2-fu-docs-perf (final run) | r2 follow-ups | #35 #32 #30 | 2 | `7a4647c` | `task/r2-fu-docs-perf` `d147213` |
 | r3-fu-cache-fallback (final run) | r2 follow-ups | #28 | 1 | `1829c8a` | `task/r3-fu-cache-fallback` `f49f656` |
+| fu-fast-small-heads (last follow-up run) | r3-fu-cache-fallback | #23 #35 #18 #21 | 1 | `284540b` | `task/fu-fast-small-heads` `523a18c` |
 
 Six of the 14 merged tasks needed a fix round before approval: geometry,
 depth, fast-backends, accurate-detectron, attention and pipeline. The changes
@@ -322,7 +325,8 @@ requested were:
 
 `benchmark-docs` added the CPU benchmark harness, reconciled the config
 defaults, rewrote the README, wrote `docs/performance.md` and added a CI
-workflow. It and the four follow-ups ran in the final Fable run (section 8).
+workflow. It and the four follow-ups ran in the final Fable run (section 8);
+`fu-fast-small-heads` ran in the last follow-up run (section 8.4).
 
 ### 7.3 Gaze research run (`wf_4de5793e-5e0`)
 
@@ -375,9 +379,10 @@ Test counts after each merge: 642, 653, 662, 663 and 673 passed (2 skipped).
 
 ### 8.2 Verification outcome
 
-**Verification is not complete.** After round 3 the verification found one
-more defect and specified the follow-up `fu-fast-small-heads`, but the run
-ended before it was implemented.
+**Verification was not complete at the end of this run.** After round 3 the
+verification found one more defect and specified the follow-up
+`fu-fast-small-heads`, but the run ended before it was implemented. It was
+fixed and verified in the last follow-up run (section 8.4).
 
 - **Track-id defect (open).** The fast profile tracks people by head box
   (`tracking.box: head`), so ids break up when heads are small or move fast.
@@ -417,15 +422,65 @@ ended before it was implemented.
   - the 24 modified files in the main checkout differ from `main` only in
     line endings (CRLF against LF; `git diff --ignore-cr-at-eol` is empty);
   - this work log branch was based on `909decc` and described the state
-    before the final run (now updated);
+    before the final run (updated at `be38af6`, and again for section 8.4);
   - six leftover worktrees remain under `.claude/worktrees/` in the main
     checkout, with empty `worktree-*` branches at `8356bf8`.
+
+### 8.4 Last follow-up run: `fu-fast-small-heads` and final verification
+
+Run on 2026-11-16 (round 4). Opus implemented and merged; Fable reviewed and
+verified. Nothing was pushed, and no GitHub issue or PR was touched.
+
+| Round | Task | Issues | Merge | What it did |
+|---|---|---|---|---|
+| 4 | `fu-fast-small-heads` | #23 #35 #18 #21 | `284540b` | **Tracking:** `tracking.box` defaults to `body` for the fast, accurate and synthetic profiles; `thesis` keeps `head` (profile and `configs/thesis.yaml`). Matching code unchanged; head-only detections still fall back to the head box. **L2CS:** new keys `gaze.l2cs.full_conf_face_px` (48) and `gaze.l2cs.min_face_px` (12). Confidence is multiplied by clip(crop side / 48, 0.25, 1); a crop below 12 px gets no estimate and no model call (counted in `gated_out`). Null or a value of 0 or less switches a knob off. Directions unchanged. README, YAML knobs and 9 new tests. |
+
+- **Review:** approved on the first round (commit `523a18c`, fast-forward on
+  `1829c8a`); merged with `--no-ff` as `284540b`, no conflicts, 12 files,
+  +202 / -25 lines. Tests: 682 passed, 2 skipped.
+- **Nits left (not blocking):** two unwrapped long README lines; the README
+  cache note says headpose and gaze caches are recomputed, but for the thesis
+  profile only the gaze cache is; one test could assert the exact id count;
+  some assertions are repeated across tests.
+
+**Fable's final verification (complete).** All 21 in-scope issues are
+addressed and no follow-up tasks remain. Checked on the merged branch at
+`284540b`, with the real YOLO and L2CS weights, load average 5-9 on 8 vCPUs:
+
+- **Track ids, fast profile, gaze off:** `museum.mp4` 120 frames: 9 ids,
+  median track 55 frames (head boxes: 52 ids, median 4.5); all 552 frames:
+  47 ids, median 83 (head boxes: 258); `got.mp4` 120 frames: 12 ids (was 17);
+  `video.mp4` 250 frames: 4 ids (unchanged).
+- **L2CS confidence:** median 0.334 on `museum.mp4` (was 0.88), 0.882 on
+  `video.mp4`; gaze share of the fusion weight median 0.60 and 0.59
+  (configured 0.60; was about 0.82 on small faces).
+- **Smoothing now acts on a real clip:** `museum.mp4` 240 frames, 20 ids;
+  re-scoring from the cache without smoothing raises target changes from 14
+  to 96.
+- **Real-time mode** with async segmentation, `museum.mp4`, 300 source
+  frames: 117 processed, 183 dropped, 9.1 FPS, latency mean 129 ms, p95
+  226 ms; 24 ids, median track 22 frames (head boxes: 152 ids, median 1).
+- **Sintel (`configs/sintel_gt.yaml`), 50 frames:** identical to the
+  previous round (1 id, gaze confidence 0.958; the size factor is 1).
+- **Stage cache:** re-scoring at 60-66 FPS with no model loaded; after the
+  tracking change only headpose and gaze were recomputed.
+- **Benchmarks:** synthetic 128.8 FPS at 640x360; fast profile on
+  `museum.mp4` 6.8 FPS at load 7-9 (persons 110 ms); micro-benchmarks PLY
+  30x, ray-box 21x, StereoBM 7.7x (all agreeing with the legacy result);
+  accurate profile skipped (no detectron2).
+- **Hygiene:** imports stay lazy, `git diff --check` clean, no CR
+  characters, only owned files changed, commit carries
+  `Refs #23, #35, #18, #21` and the Opus trailer.
+- **Housekeeping:** two worktrees remain under `.claude/worktrees/`
+  (`agent-abd694306636d51fc` on `docs/work-log`, `wf_d92e6255-9d5-2` on
+  `task/fu-fast-small-heads`); all 21 `task/*` branches are local and merged.
+  Stage caches written before this change recompute headpose and gaze once.
 
 ## 9. Results
 
 ### 9.1 Tests
 
-`python -m pytest -q` on `realtime-integration` at `1829c8a`: **673 passed, 2 skipped** (the opt-in network tests), in 127 s on CPU (final report, 2026-11-16). At `909decc` it was 615 passed.
+`python -m pytest -q` on `realtime-integration` at `284540b`: **682 passed, 2 skipped** (the opt-in network tests), in 115 s on CPU (final verification, 2026-11-16). At `1829c8a` it was 673 passed; at `909decc`, 615.
 
 ### 9.2 CPU timing (main session, 2026-11-14)
 
@@ -469,7 +524,8 @@ section 9.4 for the current figures.**
 
 Measured on 2026-11-14, before the thread cap and before `r2-fu-gaze-axes`.
 The confidence and sign points below are superseded: the confidence was
-rescaled (median 0.88), and the Gaze360/L2CS convention was fixed and checked
+rescaled (median 0.88) and later scaled by face size (median 0.33 on
+`museum.mp4`, 0.88 on `video.mp4`; section 8.4), and the Gaze360/L2CS convention was fixed and checked
 against the dataset definition (section 8.1). A gaze run now costs about
 10-25 ms per face on CPU.
 
@@ -507,6 +563,7 @@ Each run was made one at a time on the 8-vCPU WSL2 machine with no GPU, at a
 - **Model loading** happens once per run: persons about 8 s, segmentation 3-5 s, gaze 0.2-0.4 s.
 - **Variance:** the same fast-profile command gives 13-19 FPS on a quiet machine and 2-8 FPS under load (`docs/performance.md`). Sintel runs also depend on the `/mnt/c` file cache (3.15 FPS cold, 16.5 FPS warm).
 - **Thread settings matter:** before the thread caps the fast profile ran at 0.3 FPS.
+- **Final verification (section 8.4, load 5-9):** synthetic 128.8 FPS; fast profile on `museum.mp4` 6.8 FPS (persons 110 ms); real time 9.1 FPS processed (117 of 300 frames), latency mean 129 ms, p95 226 ms; micro-benchmarks PLY 30x, ray-box 21x, StereoBM 7.7x.
 
 ## 10. How to run
 
@@ -542,10 +599,10 @@ python benchmarks/bench_pipeline.py --profile fast --input Final_videos/museum.m
     --set input.realtime=true --set segmentation.async=true
 ```
 
-**Fast profile** on a video (YOLO11 weights and the L2CS ONNX download on first use into the git-ignored `weights/`; already present in the integration checkout). Until `fu-fast-small-heads` is done, add `--set tracking.box=body` to avoid the track-id defect:
+**Fast profile** on a video (YOLO11 weights and the L2CS ONNX download on first use into the git-ignored `weights/`; already present in the integration checkout). Tracking uses body boxes by default; `--set tracking.box=head` gives the old behaviour:
 
 ```bash
-python -m vfoa run --profile fast --input Final_videos/museum.mp4 --output-dir outputs/museum --video --set tracking.box=body
+python -m vfoa run --profile fast --input Final_videos/museum.mp4 --output-dir outputs/museum --video
 ```
 
 If onnxruntime or the weights are missing, gaze falls back to `head_proxy`; `backends.gaze` in `timing.json` names what actually ran.
@@ -571,7 +628,8 @@ python -m vfoa run --profile fast --input LEFT.mp4 --right RIGHT.mp4 --camera-di
 **Useful overrides:**
 
 - On a shared CPU: `--set runtime.num_threads=2`. By default YOLO uses half the logical CPUs, a quarter with `segmentation.async`.
-- Use the configured gaze/head weights directly (L2CS confidence saturates): `--set attention.fusion=fixed`.
+- Use the configured gaze/head weights directly, ignoring confidences: `--set attention.fusion=fixed`.
+- L2CS face-size knobs: `--set gaze.l2cs.full_conf_face_px=48 --set gaze.l2cs.min_face_px=12` (null or 0 switches one off).
 - Lower the gaze rate on CPU: `--set gaze.stride=3`.
 - Turn gaze off: `--set gaze.backend=none`.
 - Use the head direction as gaze: `--set gaze.backend=head_proxy`.
@@ -605,25 +663,26 @@ python benchmarks/bench_pipeline.py --profile accurate --input LEFT.mp4 --set in
 ## 11. Known issues and open questions
 
 Collected from the task `open_problems`, the reviews, the gaze report and the
-final Fable report (2026-11-16).
+final Fable reports (2026-11-16).
 
-**Open defect (fast profile)**
+**Fixed in the last follow-up run (section 8.4)**
 
-1. Tracking on the head box (`tracking.box: head`) breaks track ids when heads are small or move fast (33 ids, median length 2 frames, on the first 60 frames of `museum.mp4`). Smoothing and the target model are keyed by track id. Workaround: `--set tracking.box=body`. Fix specified as `fu-fast-small-heads` (section 8.2), not implemented.
+- The track-id defect (head-box tracking broke ids on small or fast heads) and the saturating L2CS confidence. `tracking.box` now defaults to `body` (thesis keeps `head`), and the L2CS confidence scales with face-crop size. No open defects remain; the items below are limitations.
 
 **Gaze**
 
-1. L2CS confidence saturates at about 0.9 after the `confidence_ref` rescale, whatever the face size, so on small faces gaze takes about 82% of the fusion weight instead of 60%. Workaround: `--set attention.fusion=fixed`; fix planned in `fu-fast-small-heads`. Not checked against ground truth.
-2. L2CS accuracy is unknown: there is no ground truth. The yaw sign was checked against a head-turn cue (82-100% agreement); pitch only on downward gazes. The estimate moves 12-25 degrees when the face crop shifts by 10-25%, wider than the 10-degree attention kernel.
+1. L2CS confidence is now size-aware but has not been calibrated against ground truth.
+2. L2CS accuracy is unknown: there is no ground truth. The yaw sign was checked against a head-turn cue (82-100% agreement); pitch only on downward gazes. The estimate moves by a median of 12-14 degrees when the crop size changes by 20-25% (up to 25 degrees for crop shifts), wider than the 10-degree attention kernel.
 3. The eye-ray correction for FSA-Net and Gaze360 was only exercised with fake models.
 4. The released MobileGaze ONNX files have a static batch of 1, so they need one call per face (about 10-25 ms each on CPU). Batching needs a re-export with `onnx_export.py --dynamic`.
 5. Only MobileOne-S0 has a pinned sha256. L2CS-Net ResNet-50 has no built-in download.
 6. Heads seen from behind: YOLO11n-pose sometimes reports face keypoints for them, which gives a wrong gaze and head direction. L2CS/MobileGaze does not cover the back of the head; GaT would be the option.
 7. After a fallback, the `config.yaml` written by the CLI still names the requested backend; `backends.gaze` in `timing.json` and the `gaze_fallback` counter show what ran.
+8. Faces not visible: on `museum.mp4`, 580 of 1,049 person-frames had neither gaze nor head pose (heads seen from behind or too small), so those persons are not scored.
 
 **Depth and scene**
 
-1. A live camera has no real depth: depth is a constant and few targets are found (4-6% of person-frames on 60 frames of `museum.mp4`, 9-28% over whole clips). There is no monocular depth backend, and the pipeline does not rectify raw stereo. This is the main gap for use on a robot.
+1. A live camera has no real depth: depth is a constant and few targets are found (4-6% of person-frames on 60 frames of `museum.mp4`, 6-14% in the final verification runs, 9-28% over whole clips). There is no monocular depth backend, and the pipeline does not rectify raw stereo. This is the main gap for use on a robot.
 2. StereoBM was only checked on a synthesised right view; the WLS filter needs `opencv-contrib`.
 3. YOLO11n-seg only knows the 80 COCO classes, so other objects cannot be targets in the fast profile.
 
@@ -632,7 +691,7 @@ final Fable report (2026-11-16).
 1. A cache written with one `--max-frames` value is not reused with another (`--max-frames` is part of the input fingerprint). Delete the cache after replacing weights: weight contents and the `models` section are not hashed.
 2. The quarter thread cap follows the config value `segmentation.async`, so it also applies when segmentation is served synchronously from a cache.
 3. The async worker statistics in `run.async` cover the whole run, warm-up included.
-4. Two README/config comments are slightly out of date: the cache-key dependencies (depth inputs, the headpose key for `head_proxy`) and the L2CS cost per run.
+4. Two README/config comments are slightly out of date: the cache-key dependencies (depth inputs, the headpose key for `head_proxy`) and the L2CS cost per run. The README also has two unwrapped long lines, and its cache note says headpose and gaze caches are recomputed after `fu-fast-small-heads`, but for the thesis profile only the gaze cache is.
 5. The CI workflow has only been validated as YAML; Python 3.10 was never actually run.
 6. CPU speed varies widely with host load and `/mnt/c` I/O (section 9.4).
 
@@ -649,11 +708,11 @@ final Fable report (2026-11-16).
 
 **Process**
 
-- The statuses in section 4 were verified by Fable in the final report, but the verification did not complete: `fu-fast-small-heads` is outstanding.
+- The statuses in section 4 were verified by Fable; the final verification after `fu-fast-small-heads` is complete (section 8.4).
 
 ## 12. Remaining work and next steps
 
-1. **`fu-fast-small-heads`.** Make `tracking.box: body` the default for the fast and accurate profiles (keep `head` for `thesis`), and scale the L2CS confidence by face-crop size with no estimate below 12 px. Then re-verify #23 and #35. Use a new, small workflow; do not resume older runs.
+1. **No follow-up tasks remain** (`fu-fast-small-heads` is merged and verified). For any new work, use a new, small workflow; do not resume older runs.
 2. **GPU machine validation:**
    - fast profile speed with the benchmark commands (near real time is untested on a GPU);
    - `accurate` and `thesis` profiles load and run with the real models, compared with the original thesis outputs;
@@ -663,7 +722,7 @@ final Fable report (2026-11-16).
 3. **CI.** Run the workflow on GitHub (Python 3.10 included) once the branch is pushed.
 4. **Depth for a live camera.** A monocular depth backend or raw-stereo rectification.
 5. **Gaze accuracy.** Check L2CS on footage with ground truth and calibrate its confidence.
-6. **Housekeeping.** Merge this log into `realtime-integration` if wanted; remove the six leftover worktrees and their empty `worktree-*` branches; normalise the CRLF-only changes in the main checkout.
+6. **Housekeeping.** Merge this log into `realtime-integration` if wanted; remove the leftover worktrees under `.claude/worktrees/` (including `wf_d92e6255-9d5-2` on `task/fu-fast-small-heads`) and any empty `worktree-*` branches; normalise the CRLF-only changes in the main checkout; optionally fix the small README nits (section 11).
 7. **Push or PR decision.** Decide whether to push `realtime-integration` (and this log) and open a PR that references #37. Nothing is pushed yet. GitHub issues should be closed only after verification.
 8. **Out-of-scope issues.** Still open:
    - evaluation: #25, #26, #27;
