@@ -35,6 +35,7 @@ __all__ = [
     "patch_depth",
     "eye_pixel",
     "euler_to_forward",
+    "ray_aligned",
     "gaze360_to_camera",
     "orthonormal_basis",
     "cone_rays",
@@ -238,40 +239,36 @@ def euler_to_forward(yaw_deg, pitch_deg, roll_deg=0.0) -> np.ndarray:
     return normalize(out) + 0.0
 
 
-def gaze360_to_camera(yaw_rad, pitch_rad, eye_ray: Optional[np.ndarray] = None) -> np.ndarray:
-    """Gaze360 output (yaw ``t``, pitch ``p``, radians) -> unit gaze in the camera frame.
+def ray_aligned(direction, eye_ray: Optional[np.ndarray] = None) -> np.ndarray:
+    """Rotate a direction given in the eye-ray frame into the camera frame.
 
-    Eye frame: ``g = (cos p sin t, sin p, -cos p cos t)`` (x right, y up, -z
-    towards the camera); camera frame without correction: ``(g.x, -g.y, g.z)``.
-    With ``eye_ray`` (camera -> eye vector in the camera frame, any length) the
-    eye frame is aligned with that ray: ``ez = unit(eye_ray)``,
-    ``ex = unit(cross([0,1,0], ez))`` (``(1,0,0)`` when the ray is parallel to
-    Y), ``ey = cross(ez, ex)`` and ``g_cam = g.x ex - g.y ey + g.z ez``, so
-    ``t = p = 0`` looks back along the ray at the camera.
+    The ray frame has ``z`` along the camera -> eye ray, ``x`` towards the image
+    right and ``y`` down: ``ez = unit(eye_ray)``,
+    ``rx = unit(cross([0, 1, 0], ez))`` (``(1, 0, 0)`` when the ray is parallel
+    to Y), ``ry = cross(ez, rx)`` and ``out = d.x rx + d.y ry + d.z ez``. A ray
+    along the optical axis gives the identity, so ``(0, 0, -1)`` in the ray frame
+    always looks back along the ray at the camera. Models that work on a crop
+    around the face (Gaze360, L2CS, FSA-Net) predict directions relative to
+    that ray, not to the optical axis.
 
-    ``eye_ray`` may be ``None``, a ``(3,)`` vector or a ``(..., 3)`` array (one
-    ray per person). The output shape is
-    ``broadcast_shapes(t.shape, p.shape, eye_ray.shape[:-1]) + (3,)``. Rows whose
-    ray is zero or non-finite are returned uncorrected. Raises ValueError when
-    the last dimension of ``eye_ray`` is not 3.
+    ``direction`` is ``(3,)`` or ``(..., 3)``; ``eye_ray`` is ``None``, ``(3,)``
+    or ``(..., 3)`` (any length). The output shape is
+    ``broadcast_shapes(direction.shape[:-1], eye_ray.shape[:-1]) + (3,)``, unit
+    float64. ``None`` and rows whose ray is zero or non-finite return the
+    normalised input direction unchanged. Raises ValueError when the last
+    dimension of either argument is not 3.
     """
-    t = np.asarray(yaw_rad, dtype=np.float64)
-    p = np.asarray(pitch_rad, dtype=np.float64)
+    d = np.asarray(direction, dtype=np.float64)
+    if d.ndim == 0 or d.shape[-1] != 3:
+        raise ValueError(f"direction must have shape (..., 3), got {d.shape}")
     if eye_ray is None:
-        t, p = np.broadcast_arrays(t, p)
-        out = np.stack([np.cos(p) * np.sin(t), -np.sin(p), -np.cos(p) * np.cos(t)], axis=-1)
-        return normalize(out) + 0.0
+        return normalize(d) + 0.0
     e = np.asarray(eye_ray, dtype=np.float64)
     if e.ndim == 0 or e.shape[-1] != 3:
         raise ValueError(f"eye_ray must have shape (..., 3), got {e.shape}")
-    shape = np.broadcast_shapes(t.shape, p.shape, e.shape[:-1])
-    t = np.broadcast_to(t, shape)
-    p = np.broadcast_to(p, shape)
+    shape = np.broadcast_shapes(d.shape[:-1], e.shape[:-1])
+    d = np.broadcast_to(d, shape + (3,))
     e = np.broadcast_to(e, shape + (3,))
-    gx = (np.cos(p) * np.sin(t))[..., None]
-    gy = np.sin(p)[..., None]
-    gz = (-np.cos(p) * np.cos(t))[..., None]
-    uncorrected = np.concatenate([gx, -gy, gz], axis=-1)
 
     finite = np.isfinite(e).all(axis=-1)
     e0 = np.where(finite[..., None], e, 0.0)
@@ -282,12 +279,42 @@ def gaze360_to_camera(yaw_rad, pitch_rad, eye_ray: Optional[np.ndarray] = None) 
     c = np.cross(np.array([0.0, 1.0, 0.0]), ez)
     cn = np.linalg.norm(c, axis=-1)
     cok = cn >= 1e-9
-    ex = np.where(cok[..., None], c / np.where(cok, cn, 1.0)[..., None],
+    rx = np.where(cok[..., None], c / np.where(cok, cn, 1.0)[..., None],
                   np.array([1.0, 0.0, 0.0]))
-    ey = np.cross(ez, ex)
-    corrected = gx * ex - gy * ey + gz * ez
-    out = np.where(ok[..., None], corrected, uncorrected)
-    return normalize(out) + 0.0
+    ry = np.cross(ez, rx)
+    out = d[..., 0:1] * rx + d[..., 1:2] * ry + d[..., 2:3] * ez
+    return normalize(np.where(ok[..., None], out, d)) + 0.0
+
+
+def gaze360_to_camera(yaw_rad, pitch_rad, eye_ray: Optional[np.ndarray] = None) -> np.ndarray:
+    """Gaze360-convention angles (yaw ``t``, pitch ``p``, radians) -> unit gaze in the camera frame.
+
+    Gaze360 dataset eye frame (erkil1452/gaze360, dataset/README.md): right
+    handed, +x points to the image LEFT, +y up, +z away from the camera, so
+    ``[-1, 0, 0]`` looks to the image right and ``[0, 0, -1]`` straight into the
+    camera. The labels are ``t = atan2(g.x, -g.z)`` and ``p = asin(g.y)``
+    (code/data_loader.py), i.e. ``g = (cos p sin t, sin p, -cos p cos t)``. In
+    the OpenCV camera frame (+X right, +Y down, +Z forward) this is
+    ``(-g.x, -g.y, g.z) = (-cos p sin t, -sin p, -cos p cos t)``: a proper
+    rotation, ``diag(-1, -1, 1)``. ``t = p = 0`` looks at the camera, +t turns
+    towards the image left, +p looks up. The same labels train L2CS/MobileGaze.
+
+    The models predict gaze relative to the camera -> eye ray, so when
+    ``eye_ray`` (camera -> eye vector in the camera frame, any length) is given
+    the vector is rotated with :func:`ray_aligned`; ``t = p = 0`` then looks back
+    along the ray at the camera.
+
+    ``eye_ray`` may be ``None``, a ``(3,)`` vector or a ``(..., 3)`` array (one
+    ray per person). The output shape is
+    ``broadcast_shapes(t.shape, p.shape, eye_ray.shape[:-1]) + (3,)``. Rows whose
+    ray is zero or non-finite are returned uncorrected. Raises ValueError when
+    the last dimension of ``eye_ray`` is not 3.
+    """
+    t = np.asarray(yaw_rad, dtype=np.float64)
+    p = np.asarray(pitch_rad, dtype=np.float64)
+    t, p = np.broadcast_arrays(t, p)
+    d = np.stack([-np.cos(p) * np.sin(t), -np.sin(p), -np.cos(p) * np.cos(t)], axis=-1)
+    return ray_aligned(d, eye_ray)
 
 
 def orthonormal_basis(d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

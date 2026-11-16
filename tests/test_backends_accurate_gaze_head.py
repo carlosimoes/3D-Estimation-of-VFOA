@@ -10,6 +10,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -17,7 +18,7 @@ import pytest
 from vfoa.backends.accurate.fsanet import FSANetHeadPose, crop_head, preprocess_head
 from vfoa.backends.accurate.gaze360 import MEAN, STD, Gaze360Gaze, strip_module_prefix
 from vfoa.backends.base import BackendUnavailable
-from vfoa.geometry import euler_to_forward, eye_pixel, gaze360_to_camera, unproject
+from vfoa.geometry import euler_to_forward, eye_pixel, gaze360_to_camera, ray_aligned, unproject
 from vfoa.types import Frame, Intrinsics, Person, PersonDetection
 
 REPO = Path(__file__).resolve().parent.parent
@@ -89,8 +90,11 @@ def _fsa_cfg(make_config, tmp_path: Path, extra=None):
     m1.write_bytes(b"")
     m2.write_bytes(b"")
     over = {"headpose": {"models": [str(m1), str(m2)]}}
-    if extra:
-        over.update(extra)
+    for key, value in (extra or {}).items():
+        if isinstance(value, dict) and isinstance(over.get(key), dict):
+            over[key] = {**over[key], **value}
+        else:
+            over[key] = value
     return make_config("accurate", over)
 
 
@@ -178,10 +182,84 @@ def test_fsanet_sessions_once_and_direction(make_config, tmp_path):
         out = be.estimate(_frame(i, 128), [_person(7, LEFT)])
     assert len(made) == 2
     est = out[7]
-    np.testing.assert_allclose(est.direction, euler_to_forward(20, 5, 15), atol=1e-12)
+    frame = _frame(4, 128)
+    ray = unproject(eye_pixel(np.asarray(LEFT, dtype=np.float32)), 1.0, frame.intrinsics)
+    np.testing.assert_allclose(est.direction, ray_aligned(euler_to_forward(20, 5, 15), ray), atol=1e-12)
     np.testing.assert_allclose(est.euler_deg, (20, 5, 15))
     assert np.linalg.norm(est.direction) == pytest.approx(1.0)
     assert est.frame_index == 4
+
+
+def _unit(v):
+    v = np.asarray(v, dtype=np.float64)
+    return v / np.linalg.norm(v)
+
+
+def test_fsanet_eye_frame_correction(make_config, tmp_path):
+    frame = _frame(0, 128)
+    box_ray = unproject(eye_pixel(np.asarray(RIGHT, dtype=np.float32)), 1.0, frame.intrinsics)
+    eyes = np.array([125.0, 20.0], np.float32)
+    eyes_ray = unproject(eyes.astype(np.float64), 1.0, frame.intrinsics)
+    no_intr = Frame(index=0, t=0.0, image=frame.image, intrinsics=None)
+    for ypr in ((0, 0, 0), (30, 10, 5)):
+        sess = FakeSession(ypr)
+        fwd = euler_to_forward(*ypr)
+        on = FSANetHeadPose(_fsa_cfg(make_config, tmp_path), session_factory=lambda p: sess)
+        off = FSANetHeadPose(_fsa_cfg(make_config, tmp_path, {"headpose": {"eye_frame_correction": False}}),
+                             session_factory=lambda p: sess)
+        cases = [
+            (on, frame, None, ray_aligned(fwd, box_ray)),
+            (on, frame, eyes, ray_aligned(fwd, eyes_ray)),
+            (off, frame, None, fwd),
+            (on, no_intr, None, fwd),
+        ]
+        for be, fr, eyes_px, expected in cases:
+            person = _person(3, RIGHT)
+            person.eyes_px = eyes_px
+            est = be.estimate(fr, [person])[3]
+            np.testing.assert_allclose(est.direction, expected, atol=1e-6)
+            assert np.linalg.norm(est.direction) == pytest.approx(1.0)
+            np.testing.assert_allclose(est.euler_deg, ypr, atol=1e-5)
+        if ypr == (0, 0, 0):
+            # looking at the camera from off-axis: back along the eye ray
+            np.testing.assert_allclose(cases[0][3], -_unit(box_ray), atol=1e-12)
+            np.testing.assert_allclose(cases[1][3], -_unit(eyes_ray), atol=1e-12)
+            np.testing.assert_allclose(cases[2][3], [0, 0, -1], atol=1e-12)
+
+
+def test_fsanet_default_factory_disables_spinning(make_config, tmp_path, monkeypatch):
+    created = []
+
+    class Options:
+        def __init__(self):
+            self.entries = []
+            self.intra_op_num_threads = 0
+
+        def add_session_config_entry(self, key, value):
+            self.entries.append((key, value))
+
+    class PlainOptions:
+        intra_op_num_threads = 0
+
+    def inference_session(path, sess_options=None, providers=None):
+        created.append((path, sess_options, providers))
+        return FakeSession((0, 0, 0))
+
+    fake = SimpleNamespace(SessionOptions=Options, InferenceSession=inference_session,
+                           get_available_providers=lambda: ["CPUExecutionProvider"])
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake)
+    cfg = _fsa_cfg(make_config, tmp_path, {"models": {"device": "cpu"}, "runtime": {"num_threads": 3}})
+    FSANetHeadPose(cfg).load()
+    assert len(created) == 2
+    for _path, options, providers in created:
+        assert ("session.intra_op.allow_spinning", "0") in options.entries
+        assert options.intra_op_num_threads == 3
+        assert providers == ["CPUExecutionProvider"]
+    created.clear()
+    fake.SessionOptions = PlainOptions
+    be = FSANetHeadPose(cfg)
+    be.load()
+    assert len(created) == 2 and len(be._sessions) == 2
 
 
 def test_fsanet_box_clipping(make_config, tmp_path):
@@ -283,6 +361,12 @@ def test_gaze_conversion(make_config):
     ray = unproject(eye_pixel(np.asarray(box, dtype=np.float32)), 1.0, frame.intrinsics)
     np.testing.assert_allclose(out2[0].direction, gaze360_to_camera(yaw, pitch, ray), atol=1e-6)
     assert not np.allclose(out2[0].direction, out[0].direction, atol=1e-3)
+
+    # +yaw turns towards the image left (Gaze360 eye frame: +x image-left)
+    be3, _, _ = _gaze(make_config, model=FakeGazeModel(0.3, 0.0, 0.1))
+    d = be3.estimate(frame, [_person(0, box)])[0].direction
+    assert d[0] < 0
+    np.testing.assert_allclose(d, [-np.sin(0.3), 0.0, -np.cos(0.3)], atol=1e-6)
 
 
 def test_gaze_uncertainty_and_confidence(make_config):

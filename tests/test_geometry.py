@@ -10,6 +10,7 @@ import math
 import os
 import subprocess
 import sys
+import warnings
 
 import cv2
 import numpy as np
@@ -30,6 +31,7 @@ from vfoa.geometry import (
     patch_depth,
     project_points,
     ray_aabb,
+    ray_aligned,
     segment_aabb,
     unproject,
 )
@@ -147,12 +149,65 @@ def test_euler_matches_draw_axis(rng):
 
 
 def test_gaze360_axes():
+    # Gaze360 eye frame: +x image-left, +y up, +z away from the camera
     np.testing.assert_allclose(gaze360_to_camera(0, 0), [0, 0, -1], atol=1e-12)
-    np.testing.assert_allclose(gaze360_to_camera(math.pi / 2, 0), [1, 0, 0], atol=1e-12)
+    np.testing.assert_allclose(gaze360_to_camera(math.pi / 2, 0), [-1, 0, 0], atol=1e-12)
+    np.testing.assert_allclose(gaze360_to_camera(-math.pi / 2, 0), [1, 0, 0], atol=1e-12)
     np.testing.assert_allclose(gaze360_to_camera(0, math.pi / 2), [0, -1, 0], atol=1e-12)
+    np.testing.assert_allclose(gaze360_to_camera(0, -math.pi / 2), [0, 1, 0], atol=1e-12)
     g = gaze360_to_camera(np.linspace(-3, 3, 7), np.linspace(-1, 1, 7))
     assert g.shape == (7, 3)
     np.testing.assert_allclose(np.linalg.norm(g, axis=-1), 1.0, atol=1e-12)
+
+
+def test_gaze360_eye_to_camera_map_is_rotation(rng):
+    t = rng.uniform(-3, 3, 50)
+    p = rng.uniform(-1.5, 1.5, 50)
+    G = np.stack([np.cos(p) * np.sin(t), np.sin(p), -np.cos(p) * np.cos(t)], axis=1)
+    M = np.linalg.lstsq(G, gaze360_to_camera(t, p), rcond=None)[0].T
+    np.testing.assert_allclose(M, np.diag([-1.0, -1.0, 1.0]), atol=1e-9)
+    assert np.linalg.det(M) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_ray_aligned_frame(rng):
+    for r in rng.normal(size=(20, 3)) * np.array([1.0, 1.0, 0.5]) + np.array([0.0, 0.0, 1.5]):
+        r[2] = abs(r[2]) + 0.1
+        R = ray_aligned(np.eye(3), r)
+        assert R.shape == (3, 3)
+        np.testing.assert_allclose(R @ R.T, np.eye(3), atol=1e-12)
+        assert np.linalg.det(R) == pytest.approx(1.0, abs=1e-12)
+        np.testing.assert_allclose(R[2], normalize(r), atol=1e-12)
+        assert abs(R[0, 1]) < 1e-12  # the ray frame's x axis stays horizontal
+        assert R[0, 0] > 0  # ... and points image-right
+        np.testing.assert_allclose(ray_aligned([0, 0, -1], r), -normalize(r), atol=1e-12)
+    np.testing.assert_allclose(ray_aligned(np.eye(3), [0, 0, 5]), np.eye(3), atol=1e-12)
+    np.testing.assert_allclose(ray_aligned(np.eye(3)), np.eye(3), atol=1e-12)
+    np.testing.assert_allclose(ray_aligned(np.eye(3), None), np.eye(3), atol=1e-12)
+
+
+def test_ray_aligned_degenerate_and_broadcast(rng):
+    d = np.array([0.3, -0.2, -2.0])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for bad in ([0, 0, 0], [np.nan, 0, 1], [np.inf, 0, 1], [0, 2, 0], [0, -3, 0]):
+            out = ray_aligned(d, bad)
+            assert out.shape == (3,)
+            assert np.isfinite(out).all()
+            assert np.linalg.norm(out) == pytest.approx(1.0, abs=1e-12)
+        for bad in ([0, 0, 0], [np.nan, 0, 1]):
+            np.testing.assert_allclose(ray_aligned(d, bad), normalize(d), atol=1e-12)
+        dirs = rng.normal(size=(5, 3))
+        ray = np.array([0.4, -0.1, 1.0])
+        a = ray_aligned(dirs, ray)
+        assert a.shape == (5, 3)
+        np.testing.assert_allclose(a, [ray_aligned(x, ray) for x in dirs], atol=1e-12)
+        rays = rng.normal(size=(4, 3))
+        b = ray_aligned(d, rays)
+        assert b.shape == (4, 3)
+        np.testing.assert_allclose(b, [ray_aligned(d, r) for r in rays], atol=1e-12)
+    for bad_d, bad_r in (([1.0, 2.0], None), (5.0, None), (d, [1.0, 2.0]), (d, np.zeros((3, 2)))):
+        with pytest.raises(ValueError):
+            ray_aligned(bad_d, bad_r)
 
 
 def test_gaze360_eye_ray(rng):

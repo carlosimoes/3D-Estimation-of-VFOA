@@ -171,15 +171,16 @@ class OpenGLVectorRenderer:
             except (TypeError, ValueError, IndexError):
                 return canvas
             return draw_gaze_arrow(canvas, origin, vector, length)
-        # the shader works in the Gaze360 eye frame: x right, y up, -z towards the camera
-        g = (float(vector[0]), -float(vector[1]), float(vector[2]))
+        # the shader frame is OpenGL's: x right, y up, z towards the viewer (eye at
+        # z = +20), so a camera-frame vector (x right, y down, z forward) becomes
+        # (x, -y, -z); the cv2 fallback draws the same arrow
         gl.glClear(gl.GL_COLOR_BUFFER_BIT)
         with self.shader:
             gl.glUniform1f(self.xpos, (2 * position[0] - 1) * 0.89)
             gl.glUniform1f(self.ypos, (-2 * position[1] + 1) * 0.67)
-            gl.glUniform1f(self.vdir_x, -g[0])
-            gl.glUniform1f(self.vdir_y, g[1])
-            gl.glUniform1f(self.vdir_z, -g[2])
+            gl.glUniform1f(self.vdir_x, float(vector[0]))
+            gl.glUniform1f(self.vdir_y, -float(vector[1]))
+            gl.glUniform1f(self.vdir_z, -float(vector[2]))
             gl.glUniform1f(self.arrow_size, asize)
             gl.glUniform3f(self.res_loc, self.width, self.height, 1.0)
             gl.glEnableVertexAttribArray(0)
