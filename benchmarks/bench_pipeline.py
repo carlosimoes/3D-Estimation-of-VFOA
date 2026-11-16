@@ -12,12 +12,24 @@ JSON::
      "meta": {profile, input, frames, warmup, resolution, config_hash, python,
               numpy, opencv, torch, ultralytics, onnxruntime, open3d,
               cpu_count, date, backends, fallbacks, loadavg_start,
-              loadavg_end, argv},
+              loadavg_end, argv, env, realtime, segmentation_async,
+              torch_threads},
      "timing": StageTimer.summary() of the measured frames,
-     "run": {wall_s, frames_total, warmup, latency, async, cache},
+     "run": {wall_s, frames_total, warmup, latency, latency_all, async, cache},
      "micro": {ply_roundtrip, slab_test, stereo_bm}}
 
-Default output: ``benchmarks/results/<profile>-<input stem>.json`` (git-ignored).
+``meta.realtime`` and ``meta.segmentation_async`` record ``input.realtime`` and
+``segmentation.async``; ``meta.torch_threads`` is torch's intra-op thread count
+at the end of the run (only when torch was loaded). ``run.latency`` is the
+capture-to-result latency of the measured frames only (warm-up excluded),
+measured by the benchmark itself; ``run.latency_all`` is the pipeline's own
+figure over every frame, warm-up included. The ``async`` worker statistics
+cover the whole run. With ``input.realtime`` true, ``--frames`` and
+``--warmup`` count SOURCE frames: frames are dropped while the pipeline is
+busy, so fewer frames are measured (a note is printed).
+
+Default output: ``benchmarks/results/<profile>-<input stem>.json`` (git-ignored);
+a micro-only run (``--frames 0 --micro``) writes ``benchmarks/results/micro.json``.
 
 When a backend or its weights are unavailable (e.g. ultralytics not installed,
 no network for the weights) it prints ``SKIPPED: <reason>``, writes status
@@ -84,6 +96,8 @@ MODEL_KINDS = ("depth", "persons", "headpose", "gaze", "segmentation")
 SINTEL_VIDEO = "Final_videos/mpi_sintel.mp4"
 SINTEL_CAM_DIR = "Final_videos/stereo/camdata_left/bandage_2"
 SINTEL_DEPTH_DIR = "Final_videos/stereo/training/bandage_2_depth"
+#: Default directory of the JSON results (read at call time, so tests can patch it).
+RESULTS_DIR = REPO_ROOT / "benchmarks" / "results"
 
 
 # ---------------------------------------------------------------------- arguments
@@ -165,16 +179,71 @@ def build_config(args: argparse.Namespace) -> Any:
 
 # ---------------------------------------------------------------------- pipeline run
 class _Collector:
-    """Sink that keeps the per-frame stage timings (``FrameResult.timings_ms``)."""
+    """Sink that keeps the per-frame stage timings and capture-to-result latencies.
 
-    def __init__(self) -> None:
+    ``capture`` maps a frame index to its capture time (``time.perf_counter()``
+    seconds, filled by :class:`_CaptureTimes`); ``latency_s[i]`` is the latency
+    of ``rows[i]`` in seconds, or ``None`` when the frame's capture time is
+    unknown.
+    """
+
+    def __init__(self, capture: Optional[dict[int, float]] = None) -> None:
         self.rows: list[dict[str, float]] = []
+        self.latency_s: list[Optional[float]] = []
+        self._capture = capture if capture is not None else {}
 
     def write(self, frame: Any, result: Any) -> None:
+        now = time.perf_counter()
         self.rows.append(dict(result.timings_ms or {}))
+        captured = self._capture.pop(int(result.index), None)
+        self.latency_s.append(None if captured is None else max(now - captured, 0.0))
 
     def close(self) -> None:
         pass
+
+
+class _CaptureTimes:
+    """Delegating source wrapper that records each frame's capture time by frame index.
+
+    The capture time is the source's ``last_capture_time`` (real-time sources)
+    when it is a number, else ``time.perf_counter()`` when the frame is handed
+    out; either is no later than the time the pipeline itself records.
+    """
+
+    def __init__(self, source: Any) -> None:
+        self._source = source
+        self.times: dict[int, float] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._source, name)
+
+    def __iter__(self) -> Iterator[Any]:
+        for frame in self._source:
+            captured = getattr(self._source, "last_capture_time", None)
+            if isinstance(captured, bool) or not isinstance(captured, (int, float)):
+                captured = time.perf_counter()
+            self.times[int(frame.index)] = float(captured)
+            yield frame
+
+    def close(self) -> None:
+        self._source.close()
+
+
+def _latency_summary(samples: Sequence[Optional[float]]) -> dict:
+    """``{"frames", "mean_ms", "p50_ms", "p95_ms", "max_ms"}`` of latency samples (seconds); ``{}`` if none."""
+    from vfoa.timing import StageTimer  # noqa: PLC0415
+
+    timer = StageTimer(enabled=True)
+    for sample in samples:
+        if sample is None:
+            continue
+        timer.add("latency", float(sample))
+        timer.frame_done()
+    lat = (timer.summary().get("stages") or {}).get("latency")
+    if lat is None:
+        return {}
+    return {"frames": lat["runs"], "mean_ms": lat["mean_ms"], "p50_ms": lat["p50_ms"],
+            "p95_ms": lat["p95_ms"], "max_ms": lat["max_ms"]}
 
 
 class _WithRightView:
@@ -233,8 +302,9 @@ def run_pipeline(cfg: Any, frames: int, warmup: int, stereo_synth: bool = False)
     src = open_input(cfg)
     if rights is not None:
         src = _WithRightView(src, rights)
+    src = _CaptureTimes(src)
     resolution = [int(getattr(src, "width", 0) or 0), int(getattr(src, "height", 0) or 0)]
-    collector = _Collector()
+    collector = _Collector(src.times)
     pipe = Pipeline(cfg)
     summary = pipe.run(src, [collector])
 
@@ -267,7 +337,8 @@ def run_pipeline(cfg: Any, frames: int, warmup: int, stereo_synth: bool = False)
             "wall_s": summary.get("wall_s"),
             "frames_total": n,
             "warmup": w,
-            "latency": summary.get("latency") or {},
+            "latency": _latency_summary(collector.latency_s[w:]),
+            "latency_all": summary.get("latency") or {},
             "async": summary.get("async") or {},
             "cache": summary.get("cache") or {},
         },
@@ -518,6 +589,8 @@ def collect_meta(args: argparse.Namespace, cfg: Any, run: Optional[dict] = None,
         # Thread settings change CPU results by more than 20x; always record them. Taken
         # at start-up by main(): importing ultralytics sets OMP_NUM_THREADS=1 in-process.
         "env": dict(env) if env is not None else thread_env(),
+        "realtime": bool((cfg.get("input") or {}).get("realtime")),
+        "segmentation_async": bool((cfg.get("segmentation") or {}).get("async")),
     }
     torch = sys.modules.get("torch")
     if torch is not None:
@@ -589,10 +662,26 @@ def _micro_lines(micro: dict) -> list[str]:
     return out
 
 
-def _default_out(cfg: Any) -> Path:
+def _default_out(cfg: Any, micro_only: bool = False) -> Path:
+    """Default result file: ``RESULTS_DIR/micro.json`` for a micro-only run, else ``<profile>-<input stem>.json``."""
+    if micro_only:
+        return RESULTS_DIR / "micro.json"
     path = cfg.input.get("path")
     stem = "synthetic" if path in (None, "synthetic") else (Path(str(path)).stem or "input")
-    return REPO_ROOT / "benchmarks" / "results" / f"{cfg.get('profile')}-{stem}.json"
+    return RESULTS_DIR / f"{cfg.get('profile')}-{stem}.json"
+
+
+def _realtime_note(args: argparse.Namespace, run: dict) -> str:
+    """One-line explanation of the frame counts of an ``input.realtime`` run."""
+    info = run["run"]
+    counters = (run.get("timing") or {}).get("counters") or {}
+    dropped = counters.get("dropped_frames")
+    return (
+        f"NOTE: input.realtime=true: --frames and --warmup count source frames "
+        f"({int(args.warmup)}+{int(args.frames)} read); frames are dropped while the pipeline is busy, "
+        f"so {info['frames_total']} were processed ({dropped if dropped is not None else '?'} dropped) "
+        f"and {run['frames']} measured after {info['warmup']} warm-up results."
+    )
 
 
 def _json_default(obj: Any) -> Any:
@@ -659,7 +748,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for kind, fb in run["fallbacks"].items():
             print(f"NOTE: {kind} backend {fb['from']!r} unavailable; measured the fallback {fb['to']!r}")
         for line in live_lines(run["run"]):
-            print(line)
+            if line.startswith("latency"):
+                print(line + "  [measured frames, warm-up excluded]")
+            else:
+                print(line + "  [whole run, warm-up included]")
+        if (cfg.get("input") or {}).get("realtime"):
+            print(_realtime_note(args, run))
     if args.micro:
         result["micro"] = micro_benchmarks(repeats=int(args.micro_repeats))
         for line in _micro_lines(result["micro"]):
@@ -669,7 +763,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print()
         print(format_markdown(result))
 
-    out = Path(args.out) if args.out else _default_out(cfg)
+    out = Path(args.out) if args.out else _default_out(cfg, micro_only=(args.frames == 0))
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(_sanitize(result), fh, indent=1, default=_json_default)
