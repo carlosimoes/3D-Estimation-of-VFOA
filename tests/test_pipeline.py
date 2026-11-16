@@ -12,6 +12,8 @@ from typing import Any, Optional
 import numpy as np
 import pytest
 
+from vfoa.backends import REGISTRY
+from vfoa.backends.base import BackendUnavailable
 from vfoa.backends.synthetic import (
     SyntheticDepth,
     SyntheticGaze,
@@ -489,6 +491,149 @@ def test_reopen_resets_without_reload(make_config):
     assert comparable(sink1.results) == comparable(sink2.results)
     assert len(s1["setup_ms"]) == 5 and s2["setup_ms"] == {}
     assert s2["frames"] == 20
+
+
+# ---------------------------------------------------------------------- fallback vs complete cache
+@pytest.fixture
+def flaky(monkeypatch):
+    """A registered gaze backend ``flaky`` whose availability the test controls."""
+
+    class FlakyGaze(SyntheticGaze):
+        name = "flaky"
+        available = True
+        load_calls = 0
+
+        def load(self) -> None:
+            type(self).load_calls += 1
+            if not type(self).available:
+                raise BackendUnavailable("flaky gaze is unavailable")
+            super().load()
+
+    monkeypatch.setitem(REGISTRY["gaze"], "flaky", FlakyGaze)
+    return FlakyGaze
+
+
+def _fb_cfg(make_config, cache_dir, **extra):
+    return make_config("synthetic", merge({
+        "input": {"max_frames": 30},
+        "synthetic": {"noise_deg": 2.0},
+        "gaze": {"backend": "flaky", "fallback": "head_proxy", "stride": 2},
+        "cache": {"enabled": True, "dir": str(cache_dir)},
+    }, NONE_SMOOTHING, extra))
+
+
+def _no_gaze(cfg) -> dict:
+    """Synthetic fakes for every kind except gaze (a None value would disable the stage)."""
+    bk = fakes(cfg)
+    del bk["gaze"]
+    return bk
+
+
+def _gazes(results) -> list:
+    return [(r.index, p.track_id, None if p.gaze is None else p.gaze.direction.tolist())
+            for r in results for p in r.persons]
+
+
+def test_fallback_stage_served_from_complete_cache(make_config, tmp_path, flaky):
+    cfg1 = _fb_cfg(make_config, tmp_path / "cache")
+    res1, sum1, _ = run_cfg(cfg1, _no_gaze(cfg1))
+    assert sum1["stages"]["gaze"]["runs"] == 15
+    assert sum1["cache"]["gaze"]["complete"] and "load:gaze" in sum1["setup_ms"]
+    assert sum1["backends"]["gaze"] == "flaky" and "gaze_fallback" not in sum1["counters"]
+
+    # the primary is now unavailable, but its complete cache serves every frame
+    flaky.available, flaky.load_calls = False, 0
+    cfg2 = _fb_cfg(make_config, tmp_path / "cache", cache={"mode": "read"})
+    res2, sum2, pipe2 = run_cfg(cfg2, _no_gaze(cfg2))
+    assert _gazes(res2) == _gazes(res1)
+    assert "gaze_fallback" not in sum2["counters"]
+    assert sum2["backends"]["gaze"] == "flaky" and isinstance(pipe2.backends["gaze"], flaky)
+    assert pipe2.cfg is cfg2
+    assert flaky.load_calls == 0 and "load:gaze" not in sum2["setup_ms"]
+    assert sum2["cache"]["gaze"]["hits"] == 15 and sum2["cache"]["gaze"]["misses"] == 0
+    assert sum2["cache"]["gaze"]["key"] == sum1["cache"]["gaze"]["key"]
+
+    # control: without a cache the unavailable primary falls back (and the gaze differs)
+    cfg3 = _fb_cfg(make_config, tmp_path / "other", cache={"mode": "read"})
+    res3, sum3, pipe3 = run_cfg(cfg3, _no_gaze(cfg3))
+    assert sum3["counters"].get("gaze_fallback") == 1
+    assert sum3["backends"]["gaze"] == "head_proxy"
+    assert pipe3.cfg.gaze.backend == "head_proxy" and pipe3.cfg.gaze.fallback_from == "flaky"
+    assert sum3["cache"]["gaze"]["key"] != sum1["cache"]["gaze"]["key"]
+    assert _gazes(res3) != _gazes(res1)
+
+
+@pytest.mark.parametrize("mode", ["read", "readwrite"])
+def test_complete_cache_does_not_load_available_primary(make_config, tmp_path, flaky, mode):
+    cfg1 = _fb_cfg(make_config, tmp_path / "cache")
+    res1, sum1, _ = run_cfg(cfg1, _no_gaze(cfg1))
+    assert sum1["cache"]["gaze"]["complete"] and flaky.load_calls >= 1  # eager load + _ensure_loaded
+    flaky.load_calls = 0
+
+    cfg2 = _fb_cfg(make_config, tmp_path / "cache", cache={"mode": mode})
+    res2, sum2, pipe2 = run_cfg(cfg2, _no_gaze(cfg2))
+    b = pipe2.backends["gaze"]
+    assert flaky.load_calls == 0 and "load:gaze" not in sum2["setup_ms"]
+    assert isinstance(b, flaky) and not b.is_loaded and b.calls == 0
+    assert sum2["cache"]["gaze"]["misses"] == 0 and sum2["cache"]["gaze"]["complete"]
+    assert pipe2.cfg is cfg2 and "gaze_fallback" not in sum2["counters"]
+    assert comparable(res2) == comparable(res1)
+
+
+@pytest.mark.parametrize("case", ["incomplete", "write_mode", "cache_off"])
+def test_fallback_kept_without_usable_cache(make_config, tmp_path, flaky, case):
+    cache_dir = tmp_path / "cache"
+    cfg1 = _fb_cfg(make_config, cache_dir)
+    extra: dict = {}
+    if case == "incomplete":
+        pipe1 = Pipeline(cfg1, backends=_no_gaze(cfg1))
+        with pytest.raises(KeyboardInterrupt):
+            pipe1.run(open_input(cfg1), [RaisingSink(20)])
+        assert _meta_complete(cache_dir)["gaze"] is False
+    else:
+        _, sum1, _ = run_cfg(cfg1, _no_gaze(cfg1))
+        assert sum1["cache"]["gaze"]["complete"]
+        extra = {"cache": {"mode": "write"}} if case == "write_mode" else {"cache": {"enabled": False}}
+
+    flaky.available = False
+    cfg2 = _fb_cfg(make_config, cache_dir, **extra)
+    _, sum2, pipe2 = run_cfg(cfg2, _no_gaze(cfg2))
+    assert sum2["counters"].get("gaze_fallback") == 1
+    assert sum2["backends"]["gaze"] == "head_proxy"
+    assert pipe2.cfg.gaze.backend == "head_proxy" and pipe2.cfg.gaze.fallback_from == "flaky"
+    assert cfg2.gaze.backend == "flaky"
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_cache_miss_loads_primary_never_falls_back(make_config, tmp_path, flaky, available):
+    cfg1 = _fb_cfg(make_config, tmp_path / "cache", gaze={"stride": 1})
+    world = SyntheticWorld.from_config(cfg1)
+    pipe1 = Pipeline(cfg1, backends=_no_gaze(cfg1)).open(world.fps, "fp:miss")
+    for i in range(8):
+        pipe1.process(world.frame(i))
+    sum1 = pipe1.close()
+    assert sum1["cache"]["gaze"]["complete"]
+
+    flaky.available, flaky.load_calls = available, 0
+    cfg2 = _fb_cfg(make_config, tmp_path / "cache", gaze={"stride": 1}, cache={"mode": "read"})
+    pipe2 = Pipeline(cfg2, backends=_no_gaze(cfg2)).open(world.fps, "fp:miss")
+    for i in range(8):
+        pipe2.process(world.frame(i))
+    assert flaky.load_calls == 0
+    if available:
+        out = pipe2.process(world.frame(8))
+        assert flaky.load_calls == 1
+        assert [r.index for r in out] == [8] and out[0].ran["gaze"]
+        sum2 = pipe2.close(complete=False)
+        assert sum2["cache"]["gaze"]["misses"] == 1 and sum2["cache"]["gaze"]["hits"] == 8
+    else:
+        with pytest.raises(BackendUnavailable):
+            pipe2.process(world.frame(8))
+        assert flaky.load_calls == 1
+        assert isinstance(pipe2.backends["gaze"], flaky) and pipe2.cfg is cfg2
+        sum2 = pipe2.close(complete=False)
+        assert "gaze_fallback" not in sum2["counters"]
+        assert sum2["backends"]["gaze"] == "flaky"
 
 
 # ---------------------------------------------------------------------- async hook

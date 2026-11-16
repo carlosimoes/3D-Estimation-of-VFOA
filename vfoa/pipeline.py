@@ -48,8 +48,14 @@ backend is loaded eagerly in ``open()``; if it is unavailable (missing
 package or weights) a warning is logged, the fallback backend is used and
 ``pipeline.cfg`` becomes a copy with ``cfg[kind].backend = <fallback>`` and
 ``cfg[kind].fallback_from = <primary>`` (so cache keys describe what really
-ran), and the counter ``<kind>_fallback`` is set. Such kinds skip the
-"served from complete cache, model not loaded" shortcut.
+ran), and the counter ``<kind>_fallback`` is set. Exception: when the
+cache of the PRIMARY configuration for that kind is complete (cache enabled,
+fingerprint given, kind in ``cache.stages``, mode read or readwrite), the
+primary backend is created without loading it, no fallback is applied,
+``pipeline.cfg`` stays the caller's config and nothing is counted; the stage
+is served from the cache. A frame missing from that cache loads the primary
+lazily and, if it is unavailable, ``BackendUnavailable`` propagates (the
+pipeline never switches backend in the middle of a cache).
 
 All 3D quantities are in the camera frame of the left camera (metres, +Z
 forward); times are seconds (``frame.index / fps``).
@@ -66,9 +72,9 @@ from collections import deque
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from vfoa.attention import AttentionParams, score_frame
-from vfoa.backends import KINDS, create_backend_with_fallback
+from vfoa.backends import KINDS, create_backend, create_backend_with_fallback
 from vfoa.backends.base import Backend
-from vfoa.cache import StageCache, cache_root, stage_key, stage_meta
+from vfoa.cache import StageCache, cache_root, is_complete, stage_key, stage_meta
 from vfoa.io.sources import open_source
 from vfoa.scene import SceneBuilder
 from vfoa.smoothing import DirectionSmoother, TargetSmoother
@@ -160,6 +166,24 @@ def _section(cfg: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     return cfg.get(name) or {}
 
 
+def _primary_cache_complete(cfg: Mapping[str, Any], kind: str, fingerprint: Optional[str]) -> bool:
+    """True when ``kind`` has a fallback and the cache of its primary config is complete.
+
+    Read-only probe (creates and writes nothing). False when no fallback is
+    configured, the cache is disabled, there is no fingerprint, ``kind`` is
+    not in ``cache.stages`` or the mode is ``write``.
+    """
+    sec, cc = _section(cfg, kind), _section(cfg, "cache")
+    fb, name = sec.get("fallback"), sec.get("backend")
+    if not fb or fb == name or name in (None, "none"):
+        return False
+    if not (cc.get("enabled") and fingerprint and kind in (cc.get("stages") or ())):
+        return False
+    if str(cc.get("mode", "readwrite")) not in ("read", "readwrite"):
+        return False
+    return is_complete(cache_root(cfg), kind, stage_key(cfg, kind, fingerprint))
+
+
 class Pipeline:
     """Frame-by-frame VFOA pipeline (see the module docstring).
 
@@ -237,7 +261,10 @@ class Pipeline:
                 backends[kind] = self._injected[kind]
             else:
                 t0 = time.perf_counter()
-                b, used = create_backend_with_fallback(kind, cfg)
+                if _primary_cache_complete(cfg, kind, fingerprint):
+                    b, used = create_backend(kind, cfg), None  # unloaded, no fallback
+                else:
+                    b, used = create_backend_with_fallback(kind, cfg)
                 if b is not None and b.is_loaded:
                     self.timer.add_setup(f"load:{kind}", time.perf_counter() - t0)
                 if used is not None:

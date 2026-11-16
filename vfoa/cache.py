@@ -12,8 +12,12 @@ fingerprint, config, chunk_size, n_frames, complete``; ``complete`` becomes
 true only on :meth:`StageCache.close` after a full run.
 
 The key (:func:`stage_key`) hashes the input fingerprint, the stage's config
-section, ``models``, ``camera`` and the keys of upstream stages, so changing
-attention / smoothing / scene / output settings never invalidates a cache.
+section, ``camera`` and the keys of upstream stages, so changing attention /
+smoothing / scene / output / cache settings never invalidates a cache. The
+``models`` section (where and how a model is loaded: device, weights dir,
+downloads, third-party root) and the contents of weight files are not hashed;
+delete the cache directory after replacing a weights file.
+:func:`is_complete` probes a cache without creating or writing anything.
 
 Payloads are stored with native dtypes (no pickle), so integer/bool data round
 trip exactly and floats keep their precision:
@@ -56,6 +60,7 @@ __all__ = [
     "encode",
     "decode",
     "StageCache",
+    "is_complete",
 ]
 
 logger = logging.getLogger(__name__)
@@ -98,8 +103,9 @@ def _upstream(cfg: Mapping[str, Any], stage: str, fingerprint: str) -> dict:
 def stage_key(cfg: Mapping[str, Any], stage: str, fingerprint: str) -> str:
     """16-hex-char cache key of ``stage`` for the input ``fingerprint``.
 
-    Hashes ``{format_version, stage, fingerprint, config: cfg[stage], models,
-    camera, upstream}``. Depth also includes the auxiliary input paths
+    Hashes ``{format_version, stage, fingerprint, config: cfg[stage], camera,
+    upstream}``. ``models.*`` (where and how a model is loaded) and the
+    contents of weight files are not hashed. Depth also includes the auxiliary input paths
     (``input.right_path/camera_dir/depth_dir``). Upstream: headpose and gaze
     depend on the persons key and ``tracking``; gaze also on
     ``runtime.lookahead_frames`` and ``input.fps`` and, for the ``head_proxy``
@@ -111,7 +117,6 @@ def stage_key(cfg: Mapping[str, Any], stage: str, fingerprint: str) -> str:
         "stage": stage,
         "fingerprint": str(fingerprint),
         "config": _section(cfg, stage),
-        "models": _section(cfg, "models"),
         "camera": _section(cfg, "camera"),
         "upstream": _upstream(cfg, stage, fingerprint),
     }
@@ -519,3 +524,12 @@ class StageCache:
 
     def __repr__(self) -> str:
         return f"StageCache({str(self.dir)!r}, mode={self.mode!r}, frames={self.n_frames})"
+
+
+def is_complete(root: Union[str, Path], stage: str, key: str) -> bool:
+    """True when ``<root>/<stage>-<key>`` holds a complete cache.
+
+    Same criterion as :attr:`StageCache.complete`. Read-only: never creates a
+    directory or writes a file. Unknown stage -> ValueError.
+    """
+    return StageCache(root, stage, key, mode="read").complete

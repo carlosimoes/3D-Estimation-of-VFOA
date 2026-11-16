@@ -581,11 +581,12 @@ def test_create_backend_with_fallback(make_config, tmp_path, monkeypatch):
     assert isinstance(create_backend("gaze", cfg), BinnedGaze360Backend)
 
 
-def _pipeline_cfg(make_config, tmp_path, frames=6):
+def _pipeline_cfg(make_config, tmp_path, frames=6, **sections):
     return make_config("fast", {
         "input": {"source": "synthetic", "path": "synthetic", "max_frames": frames},
         "models": {"weights_dir": str(tmp_path / "weights"), "allow_download": False},
         "smoothing": {"direction": "none", "target": "none"},
+        **sections,
     })
 
 
@@ -664,6 +665,72 @@ def test_pipeline_uses_l2cs_when_available(make_config, tmp_path, monkeypatch):
     gazes = [p.gaze for r in results for p in r.persons if p.gaze is not None]
     assert gazes and all(g.direction[0] < 0 for g in gazes)  # +30 deg = image-left
     assert len(sessions) == 1 and sessions[0].fed
+
+
+def test_pipeline_serves_l2cs_cache_without_onnxruntime(make_config, tmp_path, monkeypatch, caplog):
+    from vfoa.pipeline import Pipeline, open_input
+
+    wdir = tmp_path / "weights"
+    wdir.mkdir()
+    (wdir / "mobileone_s0_gaze.onnx").write_bytes(b"x")
+
+    class FakeOrt:
+        SessionOptions = SimpleNamespace
+
+        @staticmethod
+        def get_available_providers():
+            return ["CPUExecutionProvider"]
+
+        @staticmethod
+        def InferenceSession(path, sess_options=None, providers=None):
+            return FakeSession(const_outputs(30.0, 0.0))
+
+    def run(cfg):
+        results = []
+
+        class Sink:
+            def write(self, frame, result):
+                results.append(result)
+
+            def close(self):
+                pass
+
+        pipe = Pipeline(cfg, backends=_synthetic_backends(cfg))
+        summary = pipe.run(open_input(cfg), [Sink()])
+        gazes = [(r.index, p.track_id, None if p.gaze is None else p.gaze.direction.tolist())
+                 for r in results for p in r.persons]
+        return gazes, summary, pipe
+
+    cache = {"enabled": True, "dir": str(tmp_path / "cache")}
+    monkeypatch.setattr(L, "_import_ort", lambda: FakeOrt)
+    cfg1 = _pipeline_cfg(make_config, tmp_path, cache=cache)
+    gaze1, sum1, _ = run(cfg1)
+    assert sum1["backends"]["gaze"] == "l2cs" and "load:gaze" in sum1["setup_ms"]
+    assert sum1["cache"]["gaze"]["complete"] and sum1["cache"]["gaze"]["misses"] == 3
+    assert any(g is not None for _, _, g in gaze1)
+
+    # re-score on a machine without onnxruntime or weights: served from the cache
+    ort_calls = []
+
+    def no_ort():
+        ort_calls.append(1)
+        raise ImportError("No module named 'onnxruntime'")
+
+    monkeypatch.setattr(L, "_import_ort", no_ort)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    cfg2 = _pipeline_cfg(make_config, tmp_path, cache={**cache, "mode": "read"},
+                         models={"weights_dir": str(empty), "allow_download": False, "device": "cpu"})
+    with caplog.at_level("WARNING"):
+        gaze2, sum2, pipe2 = run(cfg2)
+    assert gaze2 == gaze1
+    assert ort_calls == []
+    assert not any("falling back" in r.getMessage() for r in caplog.records)
+    assert isinstance(pipe2.backends["gaze"], BinnedGaze360Backend) and pipe2.cfg is cfg2
+    assert sum2["backends"]["gaze"] == "l2cs" and "gaze_fallback" not in sum2["counters"]
+    assert "load:gaze" not in sum2["setup_ms"]
+    assert sum2["cache"]["gaze"]["hits"] == 3 and sum2["cache"]["gaze"]["misses"] == 0
+    assert sum2["cache"]["gaze"]["key"] == sum1["cache"]["gaze"]["key"]
 
 
 # ---------------------------------------------------------------------- import hygiene
